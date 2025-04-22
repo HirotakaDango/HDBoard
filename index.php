@@ -295,7 +295,7 @@ if (!$show_board_index) {
 
 // --- Handle Post Request (Only applicable to Channel/Thread views) ---
 $post_error = null;
-$post_success = null;
+$post_success = null; // Will likely not be displayed if redirect occurs
 
 // Check if it's a POST request AND we are NOT showing the board index
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST['comment'])) {
@@ -360,14 +360,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
                 $stmt->execute([$thread_id]);
 
                 $db->commit();
-                $post_success = "Reply #{$new_post_id} posted successfully.";
+                // Success message isn't strictly needed because we redirect immediately
+                // $post_success = "Reply #{$new_post_id} posted successfully.";
 
                 // Redirect back to the thread view including the new reply anchor
                 // Use the THREAD'S channel code for the redirect URL
                 $redirect_params = ['channel' => $thread_data['channel'], 'thread' => $thread_id];
                 $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time() . '#post-' . $new_post_id;
                 header("Location: " . $redirect_url);
-                exit;
+                exit; // IMPORTANT: Stop script execution after sending header
               }
 
             } else {
@@ -382,8 +383,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
             $new_post_id = $db->lastInsertId();
 
             $db->commit();
-            $post_success = "Thread #{$new_post_id} created successfully.";
-            // NO Redirect for new threads - stay on the board view
+            // $post_success = "Thread #{$new_post_id} created successfully."; // No longer displayed due to redirect
+
+            // --- ADDED: Redirect after successful NEW THREAD post ---
+            // Redirect back to the board view of the current channel to prevent resubmission
+            $redirect_params = ['channel' => $current_channel_code];
+            // Add cache buster (optional, but good practice)
+            $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time();
+            header("Location: " . $redirect_url);
+            exit; // IMPORTANT: Stop script execution after sending header
+            // --- END ADDED REDIRECT ---
           }
 
         } catch (PDOException $e) {
@@ -394,7 +403,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
       }
     }
   } // End channel mismatch check
-  // Continue script execution if error or new thread posted (no redirect)
+  // Continue script execution only if there was a post error (no redirect occurred)
 } // End POST request handling
 
 
@@ -435,9 +444,7 @@ if ($show_board_index) {
         'total_posts' => $total_posts
       ];
     }
-    // Sort alphabetically by channel code
-    // usort($board_index_data, function($a, $b) { return strcmp($a['code'], $b['code']); });
-    // Or keep the order defined in ALLOWED_CHANNELS
+    // Keep the order defined in ALLOWED_CHANNELS
 
   } catch (PDOException $e) {
     error_log("Database Fetch Error (Board Index): " . $e->getMessage());
