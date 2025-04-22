@@ -1,6 +1,6 @@
 # HDBoard
 
-![chrome_screenshot_Apr 22, 2025 4_45_36 PM GMT+07_00](https://github.com/user-attachments/assets/9dbba287-a76b-467b-a3aa-1b9ee896fe0c)
+![Screenshot 2025-04-22 7 18 41 PM](https://github.com/user-attachments/assets/20861e83-5346-4d85-9875-11b7e81523d8)
 
 **HDBoard** is a lightweight and customizable PHP-based message board system designed to be simple, fast, and easy to deploy. Ideal for small communities, personal projects, or internal team communication.
 
