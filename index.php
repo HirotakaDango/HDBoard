@@ -1,5 +1,4 @@
 <?php
-
 // --- Configuration ---
 define('DB_FILE', __DIR__ . '/board.db'); // Database file
 define('UPLOADS_DIR', __DIR__ . '/uploads'); // Uploads directory
@@ -181,25 +180,36 @@ function handle_upload($file_input_name) {
 }
 
 /**
- * Determines the media type for rendering.
+ * Determines the media type for rendering based on URL or filename.
  */
 function get_render_media_type($url_or_filename) {
-  // YouTube check
-  $youtube_regex = '/https?:\/\/(?:www\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/|m\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/';
+  // YouTube check (more robust)
+  $youtube_regex = '/^https?:\/\/(?:www\.)?(?:m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})(?:[?&].*)?$/i';
   if (preg_match($youtube_regex, $url_or_filename)) {
     return 'youtube';
   }
-  // Extension check
+  // Extension check (from path info)
   $extension = strtolower(pathinfo($url_or_filename, PATHINFO_EXTENSION));
   if (in_array($extension, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) return 'image';
   if (in_array($extension, VIDEO_EXTENSIONS)) return 'video';
   if (in_array($extension, AUDIO_EXTENSIONS)) return 'audio';
-  return 'unknown';
+
+  // Check if it's just a local filename (no scheme) and test its extension
+  if (!preg_match('/^https?:\/\//', $url_or_filename)) {
+      $local_extension = strtolower(pathinfo($url_or_filename, PATHINFO_EXTENSION));
+      if (in_array($local_extension, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) return 'image';
+      if (in_array($local_extension, VIDEO_EXTENSIONS)) return 'video';
+      if (in_array($local_extension, AUDIO_EXTENSIONS)) return 'audio';
+  }
+
+  return 'unknown'; // Default if it's not a known media extension or YouTube URL
 }
 
+
 /**
- * Formats comment text for display (Sanitize, NL2BR, Greentext, Reply Links).
+ * Formats comment text: Sanitizes, NL2BR, Greentext, Reply Links, and basic Linkification.
  * IMPORTANT: htmlspecialchars IS necessary here for security.
+ * This function now ONLY performs formatting *after* media links are extracted.
  */
 function format_comment($comment) {
   $comment = (string) ($comment ?? '');
@@ -207,50 +217,91 @@ function format_comment($comment) {
   // 1. Sanitize HTML to prevent XSS. THIS IS CRITICAL.
   $comment = htmlspecialchars($comment, ENT_QUOTES, 'UTF-8');
 
-  // 2. Convert newlines to <br>
-  $comment = nl2br($comment);
+  // 2. Basic Linkification (handles non-media links left in the text)
+  // Simple regex, might catch unintended strings but generally safe after htmlspecialchars
+  // It looks for http/https/ftp and turns it into a link. Avoids re-linking existing <a> tags.
+  $comment = preg_replace_callback(
+      '/(?<![\'"])(?<![=\/])(https?|ftp):\/\/([^\s<>"\'`]+)/i',
+      function ($matches) {
+          $url = $matches[0];
+          $display_url = (mb_strlen($matches[2]) > 50) ? mb_substr($matches[2], 0, 47) . '...' : $matches[2]; // Shorten displayed text
+          return '<a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars(urldecode($matches[1] . '://' . $display_url), ENT_QUOTES, 'UTF-8') . '</a>';
+      },
+      $comment
+  );
 
-  // 3. Greentext (handles start of line or after <br />)
-  $comment = preg_replace('/(^<br \/>|^\s*)(>[^>].*?)$/m', '$1<span class="greentext">$2</span>', $comment);
-  $comment = preg_replace('/(^\s*)(>[^>].*?)$/m', '$1<span class="greentext">$2</span>', $comment);
+  // 3. Convert newlines to <br> (AFTER linkification)
+  $comment = nl2br($comment, false); // Use false to avoid XHTML <br />
 
-  // 4. Reply Links (works on >> after sanitization which turns > into >)
-  $comment = preg_replace('/>>(\d+)/', '<a href="#post-$1" class="reply-mention">>>$1</a>', $comment);
+  // 4. Greentext (handles start of line or after <br>)
+  $comment = preg_replace('/(^<br>|^\s*)(>[^>].*?)$/m', '$1<span class="greentext">$2</span>', $comment);
+  $comment = preg_replace('/(^\s*)(>[^>].*?)$/m', '$1<span class="greentext">$2</span>', $comment); // Handles start of entire comment
+
+  // 5. Reply Links (works on >> after sanitization which turns > into &gt;)
+  // Need to adjust regex to look for &gt;&gt;
+  $comment = preg_replace('/&gt;&gt;(\d+)/', '<a href="#post-$1" class="reply-mention">&gt;&gt;$1</a>', $comment);
+
 
   return $comment;
 }
 
 /**
- * Finds URLs, separates media links, generates media buttons, returns cleaned text.
+ * Finds URLs in RAW text, separates media links, generates media buttons for them,
+ * returns the text with media URLs removed and the generated button/container HTML.
+ * *** MODIFIED: Ensures media buttons appear in the order links are found in the comment by appending HTML. ***
  */
 function process_comment_media_links($text, $post_element_id) {
   $media_html = '';
   $cleaned_text = $text;
   $link_counter = 0;
-  // Regex to find URLs (avoids matching inside existing tags like src/href)
+  // Regex to find URLs (avoids matching inside existing tags like src/href, although less critical here as we process raw text)
   $url_regex = '/(?<!src=["\'])(?<!href=["\'])(https?|ftp):\/\/[^\s<>"]+/i';
 
+  // Find all URLs with offsets
   if (preg_match_all($url_regex, $text, $matches, PREG_OFFSET_CAPTURE)) {
-    $matches = array_reverse($matches[0]); // Process in reverse offset order
+    // Process matches in reverse order of offset to avoid messing up indices during removal
+    $matches_reversed = array_reverse($matches[0]);
+    $media_items_to_append = []; // Store items to append in correct order
 
-    foreach ($matches as $match) {
+    foreach ($matches_reversed as $match) {
       $url = $match[0];
       $offset = $match[1];
-      $render_type = get_render_media_type($url);
+      $render_type = get_render_media_type($url); // Check if it's a media type we handle
 
       if ($render_type !== 'unknown') {
-        $link_counter++;
-        $media_id = $post_element_id . '-link-' . $link_counter;
-        $safe_url = htmlspecialchars($url, ENT_QUOTES, 'UTF-8'); // Sanitize URL for display/attributes
+        // This is a media URL - Store its info to process later
+        $media_items_to_append[] = [
+            'url' => $url,
+            'offset' => $offset,
+            'length' => strlen($url),
+            'render_type' => $render_type
+        ];
+        // Remove the raw URL from the original text variable ($cleaned_text) immediately
+        // This is safe because we process in reverse offset order
+        $cleaned_text = substr_replace($cleaned_text, '', $offset, strlen($url));
+      }
+      // Else: It's a non-media URL, leave it in $cleaned_text for format_comment to handle linkification
+    }
 
+    // Now iterate through the found media items *in forward order* (reverse the stored array)
+    // to generate HTML and append it, maintaining the original link order.
+    foreach (array_reverse($media_items_to_append) as $item) {
+        $link_counter++;
+        // Ensure media_id is unique per link across the page by including the post/reply ID
+        $media_id = $post_element_id . '-link-' . $link_counter; // Unique ID per link within the post
+        $safe_url = htmlspecialchars($item['url'], ENT_QUOTES, 'UTF-8'); // Sanitize URL for use in attributes/display
+        $render_type = $item['render_type'];
+
+        // Determine button text based on type
         $button_text = 'View Media';
         if ($render_type === 'image') $button_text = 'View Image';
         elseif ($render_type === 'video') $button_text = 'View Video';
         elseif ($render_type === 'audio') $button_text = 'View Audio';
         elseif ($render_type === 'youtube') $button_text = 'View YouTube';
 
-        // Prepend button/container HTML
-        $media_html = "
+        // Generate the HTML for the button and its container, *** APPEND *** it to $media_html
+        // Use data attributes extensively for JS interaction
+        $media_html .= "
           <div class='file-info comment-link-info'>
             <div class='media-toggle'>
               <button class='show-media-btn'
@@ -262,15 +313,12 @@ function process_comment_media_links($text, $post_element_id) {
               Link: <a href='{$safe_url}' target='_blank' rel='noopener noreferrer'>{$safe_url}</a>
             </span>
           </div>
-          <div id='media-container-{$media_id}' class='media-container' style='display:none;'></div>" . $media_html;
-
-        // Remove the raw URL from the text
-        $cleaned_text = substr_replace($cleaned_text, '', $offset, strlen($url));
-      }
+          <div id='media-container-{$media_id}' class='media-container' style='display:none;'></div>"; // Append HTML
     }
   }
 
-  return ['cleaned_text' => $cleaned_text, 'media_html' => $media_html];
+  // Return the text (now without media URLs) and the generated HTML for media buttons/containers
+  return ['cleaned_text' => trim($cleaned_text), 'media_html' => $media_html];
 }
 
 
@@ -299,26 +347,26 @@ $post_success = null; // Will likely not be displayed if redirect occurs
 
 // Check if it's a POST request AND we are NOT showing the board index
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST['comment'])) {
-  $comment = trim($_POST['comment'] ?? '');
+  $comment_raw = trim($_POST['comment'] ?? ''); // Get raw comment first
   $subject = trim($_POST['subject'] ?? ''); // Only for new threads
   $thread_id = filter_input(INPUT_POST, 'thread_id', FILTER_VALIDATE_INT); // For replies
   $posted_channel_code = trim($_POST['channel'] ?? ''); // The short code submitted from the form
 
   // --- Basic Validation (ensure channel code from form matches current context if possible) ---
-  // If replying, the $thread_id tells us the context.
-  // If new thread, the $posted_channel_code MUST match the $current_channel_code from the URL.
   if (!$thread_id && $posted_channel_code !== $current_channel_code) {
     $post_error = "Channel mismatch detected. Please post from the correct board page.";
   } else {
-    // --- Proceed with existing validation ---
-    $temp_media_check = process_comment_media_links($comment, 'temp');
-    $has_text = !empty($comment);
-    $has_media_links = !empty($temp_media_check['media_html']);
+    // --- Process comment to see if it contains non-media text or only media links ---
+    // We need to check content *after* potentially removing media links
+    // Use a dummy ID for this validation check as we don't have the real post ID yet
+    $temp_media_check = process_comment_media_links($comment_raw, 'temp-validation');
+    $has_text_content = !empty(trim($temp_media_check['cleaned_text'])); // Check if text remains after removing media links
+    $has_media_links = !empty($temp_media_check['media_html']); // Check if media links were found
     $has_file = isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE;
 
-    if (!$has_text && !$has_media_links && !$has_file) {
-      $post_error = "A post content, a file, or media links are required.";
-    } elseif (mb_strlen($comment) > 4000) {
+    if (!$has_text_content && !$has_media_links && !$has_file) {
+      $post_error = "A comment, a file, or media links are required.";
+    } elseif (mb_strlen($comment_raw) > 4000) { // Check length on the original comment
       $post_error = "Post content is too long (max 4000 characters).";
     } elseif (!$thread_id && empty($posted_channel_code)) { // Should not happen if previous check passes
       $post_error = "Channel not specified for new thread.";
@@ -339,66 +387,65 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
           $image_w = $upload_result['width'] ?? null;
           $image_h = $upload_result['height'] ?? null;
 
-          if ($thread_id) { // Posting a Reply
-            // Verify thread exists and get its channel (important for redirect)
-            $stmt = $db->prepare("SELECT id, channel FROM threads WHERE id = ?");
-            $stmt->execute([$thread_id]);
-            $thread_data = $stmt->fetch();
+          // Final check: Ensure there's *something* to post if no file was uploaded
+          if (!$has_file && !$has_text_content && !$has_media_links) {
+               $db->rollBack(); // Rollback if somehow we got here without content
+               $post_error = "A comment, a file, or media links are required.";
+          } else {
+            if ($thread_id) { // Posting a Reply
+              // Verify thread exists and get its channel (important for redirect)
+              $stmt = $db->prepare("SELECT id, channel FROM threads WHERE id = ?");
+              $stmt->execute([$thread_id]);
+              $thread_data = $stmt->fetch();
 
-            if ($thread_data) {
-              // Ensure reply is posted to the correct channel context (based on thread's channel)
-              if ($thread_data['channel'] !== $current_channel_code) {
-                // This check is redundant if the initial POST check works, but good safeguard
-                $db->rollBack();
-                $post_error = "Attempting to reply to a thread from the wrong channel page.";
+              if ($thread_data) {
+                // Ensure reply is posted to the correct channel context (based on thread's channel)
+                if ($thread_data['channel'] !== $current_channel_code) {
+                  $db->rollBack();
+                  $post_error = "Attempting to reply to a thread from the wrong channel page.";
+                } else {
+                  // Store the RAW comment in the DB
+                  $stmt = $db->prepare("INSERT INTO replies (thread_id, comment, image, image_orig_name, image_w, image_h) VALUES (?, ?, ?, ?, ?, ?)");
+                  $stmt->execute([$thread_id, $comment_raw, $image_filename, $image_orig_name, $image_w, $image_h]);
+                  $new_post_id = $db->lastInsertId();
+
+                  $stmt = $db->prepare("UPDATE threads SET last_reply_at = CURRENT_TIMESTAMP WHERE id = ?");
+                  $stmt->execute([$thread_id]);
+
+                  $db->commit();
+                  // Redirect back to the thread view including the new reply anchor
+                  $redirect_params = ['channel' => $thread_data['channel'], 'thread' => $thread_id];
+                  $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time() . '#post-' . $new_post_id;
+                  header("Location: " . $redirect_url);
+                  exit;
+                }
               } else {
-                $stmt = $db->prepare("INSERT INTO replies (thread_id, comment, image, image_orig_name, image_w, image_h) VALUES (?, ?, ?, ?, ?, ?)");
-                $stmt->execute([$thread_id, $comment, $image_filename, $image_orig_name, $image_w, $image_h]);
-                $new_post_id = $db->lastInsertId();
-
-                $stmt = $db->prepare("UPDATE threads SET last_reply_at = CURRENT_TIMESTAMP WHERE id = ?");
-                $stmt->execute([$thread_id]);
-
-                $db->commit();
-                // Success message isn't strictly needed because we redirect immediately
-                // $post_success = "Reply #{$new_post_id} posted successfully.";
-
-                // Redirect back to the thread view including the new reply anchor
-                // Use the THREAD'S channel code for the redirect URL
-                $redirect_params = ['channel' => $thread_data['channel'], 'thread' => $thread_id];
-                $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time() . '#post-' . $new_post_id;
-                header("Location: " . $redirect_url);
-                exit; // IMPORTANT: Stop script execution after sending header
+                $post_error = "Thread not found.";
+                $db->rollBack();
               }
 
-            } else {
-              $post_error = "Thread not found.";
-              $db->rollBack();
+            } else { // Posting a New Thread
+              // Use the validated $current_channel_code
+              // Store the RAW comment in the DB
+              $stmt = $db->prepare("INSERT INTO threads (channel, subject, comment, image, image_orig_name, image_w, image_h) VALUES (?, ?, ?, ?, ?, ?, ?)");
+              $stmt->execute([$current_channel_code, $subject, $comment_raw, $image_filename, $image_orig_name, $image_w, $image_h]);
+              $new_post_id = $db->lastInsertId();
+
+              $db->commit();
+              // Redirect back to the board view of the current channel
+              $redirect_params = ['channel' => $current_channel_code];
+              $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time();
+              header("Location: " . $redirect_url);
+              exit;
             }
-
-          } else { // Posting a New Thread
-            // Use the validated $current_channel_code (which matched $posted_channel_code)
-            $stmt = $db->prepare("INSERT INTO threads (channel, subject, comment, image, image_orig_name, image_w, image_h) VALUES (?, ?, ?, ?, ?, ?, ?)");
-            $stmt->execute([$current_channel_code, $subject, $comment, $image_filename, $image_orig_name, $image_w, $image_h]);
-            $new_post_id = $db->lastInsertId();
-
-            $db->commit();
-            // $post_success = "Thread #{$new_post_id} created successfully."; // No longer displayed due to redirect
-
-            // --- ADDED: Redirect after successful NEW THREAD post ---
-            // Redirect back to the board view of the current channel to prevent resubmission
-            $redirect_params = ['channel' => $current_channel_code];
-            // Add cache buster (optional, but good practice)
-            $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time();
-            header("Location: " . $redirect_url);
-            exit; // IMPORTANT: Stop script execution after sending header
-            // --- END ADDED REDIRECT ---
-          }
+          } // End content check
 
         } catch (PDOException $e) {
-          $db->rollBack();
+          if ($db->inTransaction()) { // Check if transaction is active before rollback
+              $db->rollBack();
+          }
           error_log("Database Post Error: " . $e->getMessage());
-          $post_error = "Database Error: " . $e->getMessage();
+          $post_error = "Database Error: Could not save post. " . htmlspecialchars($e->getMessage());
         }
       }
     }
@@ -538,8 +585,6 @@ if ($show_board_index) {
     die("Database Fetch Error: " . $e->getMessage()); // Keep dying on fetch errors
   }
 } // End Channel/Thread View Data Fetching
-
-
 ?>
 
 <!DOCTYPE html>
@@ -846,7 +891,7 @@ if ($show_board_index) {
        .reply {
         margin-top: 5px;
         padding: 6px 10px;
-        max-width: calc(100% - 20px);
+        max-width: calc(100% - 20px); /* Adjust max-width for potential scrollbars within */
         min-width: 200px;
         box-sizing: border-box;
        }
@@ -860,6 +905,10 @@ if ($show_board_index) {
       .post-info .subject {
         color: var(--accent-blue); /* Bluish subject */
         margin-right: 5px;
+      }
+      .post-info .name {
+          /* Optional: Style Anonymous name if needed */
+          color: var(--accent-green);
       }
       .post-info .time, .post-info .post-id {
         font-size: 0.9em;
@@ -887,18 +936,25 @@ if ($show_board_index) {
         margin-left: 5px;
       }
 
-      /* File/Media Info & Toggle */
+      /* File/Media Info & Toggle (Applied to both uploaded and linked media) */
       .file-info {
         font-size: 0.9em;
         color: #ccc; /* Light grey for file details */
-        margin-bottom: 8px;
+        margin-bottom: 8px; /* Space below each file/link block */
         display: flex;
-        align-items: flex-start;
+        align-items: flex-start; /* Align items to the top */
         flex-wrap: wrap;
-        gap: 10px;
+        gap: 5px 10px; /* Vertical gap, Horizontal gap */
+        border-bottom: 1px dashed var(--border-color); /* Separator line */
+        padding-bottom: 5px;
+        margin-top: 5px; /* Add some space above */
+      }
+      .file-info:last-of-type {
+        border-bottom: none; /* No border for the last item */
+        margin-bottom: 10px; /* More space after the last media item before comment */
       }
       .file-info .media-toggle {
-        flex-shrink: 0;
+        flex-shrink: 0; /* Prevent button from shrinking */
       }
       .file-info .media-toggle button.show-media-btn {
         padding: 4px 8px;
@@ -908,16 +964,17 @@ if ($show_board_index) {
         border: 1px solid var(--input-border);
         border-radius: 3px;
         color: var(--button-text);
-        line-height: normal;
+        line-height: 1.2; /* Adjust line height */
         text-transform: none;
-        white-space: normal;
+        white-space: normal; /* Allow button text to wrap if needed */
+        text-align: center;
       }
       .file-info .media-toggle button.show-media-btn:hover {
         background-color: var(--button-hover-bg);
       }
       .file-details {
-        flex-grow: 1;
-        margin-top: 5px; /* Align text baseline slightly better */
+        flex-grow: 1; /* Allow details to take remaining space */
+        line-height: 1.4; /* Match button line height */
         word-break: break-all; /* Allow long filenames/links to break */
       }
       .file-details a {
@@ -928,16 +985,16 @@ if ($show_board_index) {
         color: var(--link-hover);
       }
 
-      /* Media Container */
+      /* Media Container (Holds the actual img/video/audio/iframe) */
       .media-container {
         margin-top: 8px;
         margin-bottom: 10px;
         border: 1px dashed var(--border-color);
         padding: 5px;
-        display: none; /* Hidden by default */
-        max-width: 100%;
+        display: none; /* Hidden by default, toggled by JS */
+        max-width: 100%; /* Prevent overflow */
         box-sizing: border-box;
-        overflow: hidden;
+        overflow: hidden; /* Hide potential overflow */
         background-color: var(--bg-color); /* Ensure background for padding */
       }
       .media-container img,
@@ -945,28 +1002,26 @@ if ($show_board_index) {
       .media-container audio,
       .media-container iframe {
         display: block;
-        max-width: 100%;
-        height: auto;
-        margin: 0 auto;
+        max-width: 100%; /* Ensure media fits container */
+        height: auto; /* Maintain aspect ratio */
+        margin: 0 auto; /* Center block elements */
         background-color: #000; /* Black bg for media loading */
       }
-       .media-container video {
-         /* Consider adding controls styling if needed */
-       }
       .media-container audio {
-        width: 100%;
-        /* Add filter to make controls match dark theme if possible/needed */
-        /* filter: invert(1) hue-rotate(180deg); */ /* Basic inversion, might need tweaking */
+        width: 100%; /* Make audio controls take full width */
+        /* Consider filter for dark theme controls if native look is bad */
+        /* filter: invert(1) hue-rotate(180deg); */
       }
-      /* Aspect Ratio Containers */
+
+      /* Aspect Ratio Containers for Video/YouTube */
       .youtube-embed-container, .video-embed-container {
-        margin: 10px 0;
+        margin: 5px 0; /* Reduced margin */
         position: relative;
-        padding-bottom: 56.25%; /* 16:9 */
+        padding-bottom: 56.25%; /* 16:9 aspect ratio */
         height: 0;
         overflow: hidden;
         max-width: 100%;
-        background: #000;
+        background: #000; /* Black background */
       }
       .youtube-embed-container iframe,
       .video-embed-container video {
@@ -975,24 +1030,26 @@ if ($show_board_index) {
         left: 0;
         width: 100%;
         height: 100%;
-        border: none;
+        border: none; /* Remove iframe border */
       }
 
       /* Comment Styling */
       .comment {
-        margin-top: 10px;
+        margin-top: 10px; /* Space above comment text */
         line-height: 1.5;
         overflow-wrap: break-word;
         word-break: break-word;
         color: var(--text-color); /* Ensure comment text uses main text color */
       }
-      .comment-truncated { display: block; }
-      .comment-full { display: none; }
+      .comment-truncated { display: block; } /* Visible by default */
+      .comment-full { display: none; } /* Hidden by default */
       .show-full-text-btn {
+        display: inline-block; /* Allow margin */
         padding: 2px 5px;
         font-size: 0.8em;
         cursor: pointer;
         margin-left: 5px;
+        margin-top: 5px; /* Add some space above */
         background-color: var(--button-bg);
         border: 1px solid var(--input-border);
         border-radius: 3px;
@@ -1003,10 +1060,13 @@ if ($show_board_index) {
       .greentext { color: var(--greentext-color); }
       .reply-mention {
         color: var(--reply-mention-color);
-        text-decoration: underline;
+        text-decoration: none; /* Remove underline from >> links */
         font-weight: bold;
       }
-      .reply-mention:hover { color: var(--link-hover); }
+      .reply-mention:hover {
+        color: var(--link-hover);
+        text-decoration: underline; /* Underline on hover */
+       }
 
       /* Omitted Posts */
       .omitted-posts {
@@ -1091,12 +1151,16 @@ if ($show_board_index) {
 
       /* Anchor scroll padding */
       :target {
-        scroll-margin-top: 20px; /* Adjust as needed */
-        /* Add highlight on target */
-        /* Maybe handled by JS hover effect now, but could add a subtle border */
-         /* border-left: 3px solid var(--accent-red); */
-         /* padding-left: calc(12px - 3px); /* Adjust padding to compensate */
+        scroll-margin-top: 70px; /* Adjust to account for fixed header or other elements */
       }
+
+       /* Highlight on target */
+       .post.highlighted, .reply.highlighted {
+           background-color: #404050 !important; /* Use !important carefully */
+           border-color: var(--link-color) !important;
+           transition: background-color 0.3s ease, border-color 0.3s ease;
+       }
+
 
       /* Reply form specific in thread view */
       #post-form h4, .reply-form-container h4 {
@@ -1139,7 +1203,8 @@ if ($show_board_index) {
           margin-top: 10px;
         }
 
-        .file-info { flex-direction: column; align-items: flex-start; }
+        /* Stack file info elements on mobile */
+        .file-info { flex-direction: column; align-items: stretch; gap: 5px 0; }
         .file-info .media-toggle { margin-bottom: 5px; }
         .file-info .file-details { margin-top: 0; font-size: 1em;}
 
@@ -1152,11 +1217,14 @@ if ($show_board_index) {
         }
 
         .post-info { font-size: 0.9em; }
-        .post-info .time, .post-info .post-id, .post-info .reply-link { font-size: 1em; margin-left: 4px; }
+        .post-info .time, .post-info .post-id, .post-info .reply-link { font-size: 1em; margin-left: 4px; display: inline-block; margin-bottom: 3px; /* Stack info slightly better */ }
+        .post-info .reply-count { margin-left: 4px; }
+
 
         .pagination { font-size: 1em; }
         .pagination a, .pagination span { padding: 3px 6px; }
         .thread-view-header { font-size: 1em; }
+        :target { scroll-margin-top: 60px; } /* Adjust scroll margin for mobile */
       }
 
       @media (min-width: 768px) {
@@ -1164,9 +1232,10 @@ if ($show_board_index) {
         .post-form td { display: table-cell; }
         .reply-form-container th { width: 80px; }
 
-        .file-info { flex-direction: row; align-items: flex-start; }
+        /* Restore flex row for file info on larger screens */
+        .file-info { flex-direction: row; align-items: flex-start; gap: 5px 10px; }
         .file-info .media-toggle { margin-bottom: 0; }
-        .file-info .file-details { margin-top: 5px; }
+        .file-info .file-details { margin-top: 0; } /* Reset top margin */
 
         .reply-container { margin-left: 20px; }
         .reply, .omitted-posts, .reply-form-container {
@@ -1181,7 +1250,7 @@ if ($show_board_index) {
         justify-content: center; /* Center items horizontally */
         /* align-items: center; */  /* Uncomment to center vertically too (if container has height) */
       }
-    
+
       /* Optional: Ensure image doesn't overflow container */
       .flex-container img {
         max-width: 100%;
@@ -1203,18 +1272,51 @@ if ($show_board_index) {
           form.style.display = isHidden ? 'block' : 'none';
           if (isHidden) {
             form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            // Optionally focus the textarea
+            const textarea = form.querySelector('textarea[name="comment"]');
+            if (textarea) {
+              textarea.focus();
+            }
           }
         }
       }
 
       // Toggle media visibility and load content dynamically
-      function toggleMedia(button, mediaId) {
-        const mediaContainer = document.getElementById('media-container-' + mediaId);
-        if (!mediaContainer) return;
+      // *** MODIFIED: Find the media container structurally instead of solely by ID ***
+      function toggleMedia(button) { // Only need the button element as argument
+        // Find the parent .file-info div
+        const fileInfoDiv = button.closest('.file-info');
+        if (!fileInfoDiv) {
+            console.error("Toggle Media Error: Could not find parent .file-info for button.", button);
+            return;
+        }
 
-        const isHidden = (mediaContainer.style.display === 'none' || mediaContainer.style.display === '');
+        // The media container is the immediate next sibling of the .file-info div
+        const mediaContainer = fileInfoDiv.nextElementSibling;
+
+        // Verify that the found element is indeed a media container
+        if (!mediaContainer || !mediaContainer.classList.contains('media-container')) {
+            console.error("Toggle Media Error: Could not find the adjacent .media-container sibling for button.", button, "Next sibling found:", mediaContainer);
+            return;
+        }
+
+        // Get necessary data attributes from the button
+        const mediaId = button.dataset.mediaId; // Still get ID for data-loaded-url check
         const mediaUrl = button.dataset.mediaUrl;
         const mediaType = button.dataset.mediaType;
+
+        if (!mediaId || !mediaUrl || !mediaType) {
+             console.error("Toggle Media Error: Missing data attributes on button.", button);
+             return;
+        }
+         // Optional: Validate found container ID matches button's data-media-id (extra check)
+         if (mediaContainer.id !== ('media-container-' + mediaId)) {
+             console.warn("Toggle Media Warning: Found container by structure, but ID mismatch.", "Button ID:", mediaId, "Container ID:", mediaContainer.id);
+             // We proceed with the found container, trusting the structure over ID lookup here
+         }
+
+
+        const isHidden = (mediaContainer.style.display === 'none' || mediaContainer.style.display === '');
 
         // Determine button text based on type and state
         let viewButtonText = 'View Media';
@@ -1236,28 +1338,33 @@ if ($show_board_index) {
 
           // Load media if not already loaded or if URL changed (unlikely here)
           if (mediaContainer.innerHTML.trim() === '' || mediaContainer.dataset.loadedUrl !== mediaUrl) {
-            mediaContainer.innerHTML = ''; // Clear previous
+            mediaContainer.innerHTML = '<span>Loading...</span>'; // Add loading indicator
             mediaContainer.dataset.loadedUrl = mediaUrl; // Mark as loaded
 
             let mediaElementHTML = '';
             if (IMAGE_TYPES.includes(mediaType)) {
-              mediaElementHTML = `<a href="${mediaUrl}" target="_blank"><img src="${mediaUrl}" alt="Media Image"></a>`;
+              // Wrap image in a link to the full image
+              mediaElementHTML = `<a href="${mediaUrl}" target="_blank" rel="noopener noreferrer"><img src="${mediaUrl}" alt="Media Image" loading="lazy"></a>`;
             } else if (VIDEO_TYPES.includes(mediaType)) {
+              // Use the aspect ratio container
               mediaElementHTML = `<div class="video-embed-container"><video src="${mediaUrl}" controls playsinline preload="metadata"></video></div>`;
             } else if (AUDIO_TYPES.includes(mediaType)) {
               mediaElementHTML = `<audio src="${mediaUrl}" controls preload="metadata"></audio>`;
             } else if (mediaType === YOUTUBE_TYPE) {
+              // Extract YouTube video ID (more robust regex)
               const youtubeRegexMatch = mediaUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|m\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/);
               const videoId = (youtubeRegexMatch && youtubeRegexMatch[1]) ? youtubeRegexMatch[1] : null;
               if (videoId) {
                 const embedUrl = `https://www.youtube.com/embed/${videoId}`;
+                // Use the aspect ratio container
                 mediaElementHTML = `<div class="youtube-embed-container"><iframe src="${embedUrl}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen loading="lazy"></iframe></div>`;
               } else {
-                mediaElementHTML = '<span>Failed to embed YouTube video (Invalid URL).</span>';
+                mediaElementHTML = '<span class="error">Failed to embed YouTube video (Invalid URL).</span>';
               }
             } else {
-              mediaElementHTML = '<span>Unsupported media type: ' + mediaType + '</span>';
+              mediaElementHTML = '<span class="error">Unsupported media type: ' + mediaType + '</span>';
             }
+            // Replace loading indicator with actual media HTML
             mediaContainer.innerHTML = mediaElementHTML;
           }
         } else {
@@ -1267,14 +1374,30 @@ if ($show_board_index) {
 
           // Stop media playback when hiding
           mediaContainer.querySelectorAll('video, audio, iframe').forEach(mediaElement => {
-            if (typeof mediaElement.pause === 'function' && !mediaElement.paused) {
-              mediaElement.pause();
+            if (mediaElement.tagName === 'VIDEO' || mediaElement.tagName === 'AUDIO') {
+              if (typeof mediaElement.pause === 'function' && !mediaElement.paused) {
+                mediaElement.pause();
+              }
             }
-            // Attempt to stop YouTube iframe
-            if (mediaElement.tagName === 'IFRAME' && mediaElement.src.includes('youtube.com/embed') && mediaElement.contentWindow) {
-              mediaElement.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', '*');
+            // Attempt to stop YouTube iframe using postMessage API
+            else if (mediaElement.tagName === 'IFRAME' && mediaElement.src.includes('youtube.com/embed')) {
+              try {
+                 // Clearing the src attribute is a simple way to stop playback and unload
+                 mediaElement.src = '';
+                 // Alternatively, use postMessage if iframe hasn't been removed/re-added:
+                 // if (mediaElement.contentWindow) {
+                 //   mediaElement.contentWindow.postMessage('{"event":"command","func":"pauseVideo","args":""}', '*');
+                 //   mediaElement.contentWindow.postMessage('{"event":"command","func":"stopVideo","args":""}', '*');
+                 // }
+              } catch (e) {
+                console.warn("Could not stop YouTube iframe playback.", e);
+              }
             }
           });
+           // Clear innerHTML when hiding to ensure it's reloaded on next show,
+           // which helps with stopping embeds and handling potential content changes.
+           mediaContainer.innerHTML = '';
+           delete mediaContainer.dataset.loadedUrl; // Remove loaded marker
         }
       }
 
@@ -1290,63 +1413,111 @@ if ($show_board_index) {
 
       // --- DOM Ready Event Listener ---
       document.addEventListener('DOMContentLoaded', function() {
-        // Attach listeners to dynamic elements
 
-        // Media toggle buttons
+        // --- Event Delegation for Dynamic Elements ---
+
         document.body.addEventListener('click', function(event) {
+          // Media toggle buttons
           if (event.target.matches('.show-media-btn')) {
-            const mediaId = event.target.dataset.mediaId;
-            if (mediaId) {
-              toggleMedia(event.target, mediaId);
-            }
+             // Pass the button element directly to toggleMedia
+            toggleMedia(event.target);
           }
-        });
-
-        // Text expansion buttons
-        document.body.addEventListener('click', function(event) {
-          if (event.target.matches('.show-full-text-btn')) {
+          // Text expansion buttons
+          else if (event.target.matches('.show-full-text-btn')) {
             const fullTextId = event.target.dataset.targetId;
              if (fullTextId) {
               toggleFullText(event.target, fullTextId);
             }
           }
-        });
-
-        // NSFW Warning Close Button
-        const nsfwWarning = document.getElementById('nsfw-warning');
-        const nsfwCloseBtn = document.getElementById('nsfw-warning-close');
-        if (nsfwWarning && nsfwCloseBtn) {
-          nsfwCloseBtn.addEventListener('click', function() {
-            nsfwWarning.style.display = 'none';
-          });
-        }
-
-        // Reply mention hover effect
-        document.body.addEventListener('mouseover', function(event) {
-          if (event.target.matches('.reply-mention')) {
-            const targetId = event.target.getAttribute('href')?.substring(1);
-            if (!targetId) return;
-            const targetPost = document.getElementById(targetId);
-            if (targetPost) {
-              targetPost.style.backgroundColor = '#404050'; // Darker highlight
-              targetPost.style.borderColor = '#7aa2f7'; // Link color border
-              targetPost.dataset.originalBg = targetPost.style.backgroundColor; // Store for mouseout
-              targetPost.dataset.originalBorder = targetPost.style.borderColor;
-            }
-          }
-        });
-        document.body.addEventListener('mouseout', function(event) {
-          if (event.target.matches('.reply-mention')) {
-             const targetId = event.target.getAttribute('href')?.substring(1);
-             if (!targetId) return;
-             const targetPost = document.getElementById(targetId);
-             if (targetPost) {
-               // Reset styles - assumes default is set by CSS, don't rely on dataset if complex
-               targetPost.style.backgroundColor = '';
-               targetPost.style.borderColor = '';
+          // NSFW Warning Close Button
+          else if (event.target.matches('#nsfw-warning-close')) {
+             const nsfwWarning = document.getElementById('nsfw-warning');
+             if (nsfwWarning) {
+                 nsfwWarning.style.display = 'none';
              }
           }
+          // Quick Reply Links (using event delegation)
+          else if (event.target.matches('.reply-link[href^="#reply-form-"]')) {
+              event.preventDefault(); // Prevent default jump
+              const threadIdMatch = event.target.getAttribute('href').match(/#reply-form-(\d+)/);
+              if (threadIdMatch && threadIdMatch[1]) {
+                const threadId = threadIdMatch[1];
+                toggleReplyForm(threadId);
+              }
+          }
         });
+
+
+        // --- Reply Mention Hover/Click Highlighting ---
+        let highlightTimeout = null;
+
+        function highlightPost(targetPost, addClass) {
+            if (!targetPost) return;
+            if (addClass) {
+                targetPost.classList.add('highlighted');
+                // Remove highlight after a delay
+                clearTimeout(highlightTimeout); // Clear previous timeout if any
+                highlightTimeout = setTimeout(() => {
+                    targetPost.classList.remove('highlighted');
+                }, 1500); // Highlight duration in ms
+            } else {
+                targetPost.classList.remove('highlighted');
+                 clearTimeout(highlightTimeout); // Clear timeout if mouse leaves before it fires
+            }
+        }
+
+        // Highlight on hover
+        document.body.addEventListener('mouseover', function(event) {
+          // Use closest to handle clicks on children of the link if needed
+          const replyMentionLink = event.target.closest('.reply-mention');
+          if (replyMentionLink) {
+            const targetId = replyMentionLink.getAttribute('href')?.substring(1); // Get target ID like "post-123"
+            if (!targetId) return;
+            const targetPost = document.getElementById(targetId)?.closest('.post, .reply'); // Find parent post/reply div
+            highlightPost(targetPost, true); // Add highlight class on hover
+          }
+        });
+
+        // Remove highlight on mouse out
+        document.body.addEventListener('mouseout', function(event) {
+           const replyMentionLink = event.target.closest('.reply-mention');
+           if (replyMentionLink) {
+             const targetId = replyMentionLink.getAttribute('href')?.substring(1);
+             if (!targetId) return;
+             const targetPost = document.getElementById(targetId)?.closest('.post, .reply');
+             // Remove highlight immediately on mouseout
+             highlightPost(targetPost, false);
+           }
+        });
+
+        // Highlight on click (for navigation)
+        document.body.addEventListener('click', function(event) {
+           const replyMentionLink = event.target.closest('.reply-mention');
+           if (replyMentionLink && replyMentionLink.getAttribute('href').startsWith('#post-')) {
+            const targetId = replyMentionLink.getAttribute('href').substring(1);
+            if (!targetId) return;
+            const targetPost = document.getElementById(targetId)?.closest('.post, .reply');
+            // The browser will navigate, the :target pseudo-class adds scroll margin.
+            // We add a temporary visual highlight as well.
+            highlightPost(targetPost, true);
+            // Note: Preventing default jump and doing smooth scroll + highlight manually is an alternative:
+            // event.preventDefault();
+            // const targetElement = document.getElementById(targetId);
+            // if (targetElement) {
+            //    targetElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            //    highlightPost(targetPost, true);
+            //    window.history.pushState(null, '', '#' + targetId); // Manually update URL hash
+            // }
+          }
+        });
+
+
+        // --- Initial Highlighting if arriving via hash ---
+        if (window.location.hash && window.location.hash.startsWith('#post-')) {
+            const targetId = window.location.hash.substring(1);
+            const targetPost = document.getElementById(targetId)?.closest('.post, .reply');
+            highlightPost(targetPost, true);
+        }
 
       }); // End DOMContentLoaded
     </script>
@@ -1357,30 +1528,32 @@ if ($show_board_index) {
         <?php /* Adjust title based on view */ ?>
         <h1><?php echo $show_board_index ? 'HDBoard - Board Index' : ('/' . htmlspecialchars($current_channel_code) . '/ - ' . htmlspecialchars($current_channel_display_name) . ($viewing_thread_id ? ' - Thread No.' . htmlspecialchars($viewing_thread_id) : '')); ?></h1>
         <div class="flex-container">
-          <img src="/HDBoard.png" alt="HDBoard Image">
+          <?php // Ensure the image path is correct relative to where index.php is run ?>
+          <img src="/HDBoard.png" alt="HDBoard Image" style="max-width: 100%; height: auto; max-height: 200px; margin: 0 auto; display: block;">
         </div>
         <nav class="channel-nav">
           <?php
-          // Add a "Home" link
-           $home_class = $show_board_index ? 'active' : ''; // Highlight Home if on index page
-           echo '<a href="./" class="board-index-home-link ' . $home_class . '">Home</a>';
+            // Add a "Home" link
+            $home_class = $show_board_index ? 'active' : ''; // Highlight Home if on index page
+            echo '<a href="./" class="board-index-home-link ' . $home_class . '">Home</a>';
 
-          // Existing channel links
-          foreach (ALLOWED_CHANNELS as $channel_code_nav) {
-            $display_name = CHANNEL_NAMES[$channel_code_nav] ?? $channel_code_nav;
-            // Active class only if NOT showing board index AND current channel matches
-            $class = (!$show_board_index && $channel_code_nav === $current_channel_code) ? 'active' : '';
-            echo '<a href="./?channel=' . urlencode($channel_code_nav) . '" class="' . $class . '">' . htmlspecialchars($display_name) . '</a>';
-          }
+            // Existing channel links
+            foreach (ALLOWED_CHANNELS as $channel_code_nav) {
+              $display_name = CHANNEL_NAMES[$channel_code_nav] ?? $channel_code_nav;
+              // Active class only if NOT showing board index AND current channel matches
+              $class = (!$show_board_index && $channel_code_nav === $current_channel_code) ? 'active' : '';
+              echo '<a href="./?channel=' . urlencode($channel_code_nav) . '" class="' . $class . '">' . htmlspecialchars($display_name) . '</a>';
+            }
           ?>
         </nav>
       </header>
 
       <?php // Display errors or success messages (use htmlspecialchars for safety)
-      if ($post_error): ?>
-        <p class="error"><?php echo htmlspecialchars($post_error); ?></p>
+        if ($post_error): ?>
+        <p class="error"><?php echo $post_error; // Already sanitized if it came from DB error ?></p>
       <?php endif;
-      if ($post_success): ?>
+        // Success messages are usually not shown due to redirects, but kept for debugging
+        if ($post_success): ?>
         <p class="success"><?php echo htmlspecialchars($post_success); ?></p>
       <?php endif; ?>
 
@@ -1407,7 +1580,7 @@ if ($show_board_index) {
       <?php else: // --- Channel or Thread View --- ?>
 
         <?php // NSFW warning (only shown on specific channel views)
-        if (in_array($current_channel_code, NSFW_CHANNELS)): ?>
+          if (!$viewing_thread_id && in_array($current_channel_code, NSFW_CHANNELS)): // Only on board view ?>
           <div class="nsfw-warning" id="nsfw-warning">
             <strong>Warning:</strong> Content on /<?php echo htmlspecialchars($current_channel_code); ?>/ (<?php echo htmlspecialchars($current_channel_display_name); ?>) may be NSFW. Proceed with caution.
             <button class="nsfw-warning-close" id="nsfw-warning-close" title="Close Warning" aria-label="Close Warning">×</button>
@@ -1447,62 +1620,73 @@ if ($show_board_index) {
 
 
           <?php
-          // Display OP Post
-          $thread = $thread_op;
-          $thread_id = $thread['id'];
-          $post_element_id = 'post-' . $thread_id;
+            // Display OP Post
+            $thread = $thread_op;
+            $thread_id = $thread['id'];
+            // Use the thread's ID for the post element ID
+            $post_element_id = 'post-' . $thread_id; // Unique ID for this post's elements
 
-          $post_media_buttons_html = '';
-          $cleaned_comment_content_raw = $thread['comment'];
+            $post_media_buttons_html = ''; // Initialize HTML string for media buttons/containers
 
-          // Handle Uploaded File
-          if ($thread['image']) {
-            $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($thread['image']); // Sanitize filename part of URL
-            $orig_name = htmlspecialchars($thread['image_orig_name'] ?? $thread['image']); // Sanitize original name for display
-            $img_w = $thread['image_w'] ?? '?';
-            $img_h = $thread['image_h'] ?? '?';
-            $file_size = @filesize(UPLOADS_DIR . '/' . $thread['image']);
-            $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
-            $uploaded_media_type = get_render_media_type($thread['image']);
-            $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
+            // 1. Handle Uploaded File (if exists)
+            if ($thread['image']) {
+              $uploaded_media_local_path = UPLOADS_DIR . '/' . $thread['image'];
+              $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($thread['image']); // Sanitize filename part of URL
+              $orig_name = htmlspecialchars($thread['image_orig_name'] ?? $thread['image']); // Sanitize original name for display
+              $img_w = $thread['image_w'] ?? '?';
+              $img_h = $thread['image_h'] ?? '?';
+              $file_size = @file_exists($uploaded_media_local_path) ? @filesize($uploaded_media_local_path) : 0;
+              $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
+              $uploaded_media_type = get_render_media_type($thread['image']); // Determine type from filename
+              $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
+              // Ensure uploaded media ID is unique using the post ID
+              $media_item_id = $post_element_id . '-uploaded'; // Unique ID for this uploaded media item
 
-            $post_media_buttons_html .= "
-              <div class='file-info uploaded-file-info'>
-                <div class='media-toggle'>
-                  <button class='show-media-btn'
-                      data-media-id='{$post_element_id}-uploaded'
-                      data-media-url='{$uploaded_media_url}'
-                      data-media-type='{$uploaded_media_type}'>{$view_button_text}</button>
+              $post_media_buttons_html .= "
+                <div class='file-info uploaded-file-info'>
+                  <div class='media-toggle'>
+                    <button class='show-media-btn'
+                        data-media-id='{$media_item_id}'
+                        data-media-url='{$uploaded_media_url}'
+                        data-media-type='{$uploaded_media_type}'>{$view_button_text}</button>
+                  </div>
+                  <span class='file-details'>
+                    File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")
+                  </span>
                 </div>
-                <span class='file-details'>
-                  File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")
-                </span>
-              </div>
-              <div id='media-container-{$post_element_id}-uploaded' class='media-container' style='display:none;'></div>";
-          }
+                <div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
+            }
 
-          // Process Comment Media Links
-          $link_media_result = process_comment_media_links($cleaned_comment_content_raw, $post_element_id);
-          $cleaned_comment_content_raw = $link_media_result['cleaned_text'];
-          $post_media_buttons_html .= $link_media_result['media_html'];
+            // 2. Process Comment for Media Links
+            // Get the RAW comment from the database
+            $comment_raw_from_db = $thread['comment'];
+            // Process it to extract media links and get cleaned text + link media HTML
+            // Passes $post_element_id so link IDs are unique per post/reply
+            $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
+            $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
+            $post_media_buttons_html .= $link_media_result['media_html']; // Append HTML for linked media
 
-          // Format final comment (already sanitized inside format_comment)
-          $formatted_comment = format_comment($cleaned_comment_content_raw);
+            // 3. Format the remaining comment text (which now excludes media URLs)
+            $formatted_comment = format_comment($cleaned_comment_for_formatting);
+            // No truncation needed in thread view
 
           ?>
           <div class="thread" id="thread-<?php echo $thread_id; ?>">
-            <div class="post op" id="post-<?php echo $thread_id; ?>">
+            <div class="post op" id="<?php echo $post_element_id; ?>"> <?php // Use $post_element_id here ?>
               <p class="post-info">
                 <?php if (!empty($thread['subject'])): ?>
-                  <span class="subject"><?php echo htmlspecialchars($thread['subject']); ?></span> <?php // Sanitize subject ?>
+                  <span class="subject"><?php echo htmlspecialchars($thread['subject']); ?></span>
                 <?php endif; ?>
                 <span class="name">Anonymous</span>
                 <span class="time"><?php echo date('Y/m/d(D) H:i:s', strtotime($thread['created_at'])); ?></span>
                 <span class="post-id">No.<?php echo $thread_id; ?></span>
+                <a href="#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a> <?php // Permalink for OP ?>
               </p>
-              <?php echo $post_media_buttons_html; // Output generated media buttons/containers ?>
+
+              <?php echo $post_media_buttons_html; // Output ALL generated media buttons/containers (uploaded + linked) ?>
+
               <div class="comment">
-                <?php echo $formatted_comment; // Output formatted comment (already sanitized) ?>
+                <?php echo $formatted_comment; // Output formatted comment (media links removed, other links added) ?>
               </div>
             </div>
 
@@ -1512,27 +1696,30 @@ if ($show_board_index) {
               $all_thread_replies = $replies_to_display[$thread_id] ?? [];
               foreach ($all_thread_replies as $reply):
                 $reply_id = $reply['id'];
-                $post_element_id = 'post-' . $reply_id;
+                // Use the reply's ID for the post element ID
+                $post_element_id = 'post-' . $reply_id; // Unique ID for this reply's elements
 
-                $reply_media_buttons_html = '';
-                $cleaned_comment_content_raw = $reply['comment'];
+                $reply_media_buttons_html = ''; // Initialize for reply
 
-                // Handle Uploaded File for Reply
+                // 1. Handle Uploaded File for Reply
                 if ($reply['image']) {
+                  $uploaded_media_local_path = UPLOADS_DIR . '/' . $reply['image'];
                   $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($reply['image']);
                   $orig_name = htmlspecialchars($reply['image_orig_name'] ?? $reply['image']);
                   $img_w = $reply['image_w'] ?? '?';
                   $img_h = $reply['image_h'] ?? '?';
-                  $file_size = @filesize(UPLOADS_DIR . '/' . $reply['image']);
+                  $file_size = @file_exists($uploaded_media_local_path) ? @filesize($uploaded_media_local_path) : 0;
                   $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
                   $uploaded_media_type = get_render_media_type($reply['image']);
                   $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
+                  // Ensure uploaded media ID is unique using the post ID
+                  $media_item_id = $post_element_id . '-uploaded'; // Unique ID for this uploaded media item
 
                   $reply_media_buttons_html .= "
                     <div class='file-info uploaded-file-info'>
                       <div class='media-toggle'>
                         <button class='show-media-btn'
-                            data-media-id='{$post_element_id}-uploaded'
+                            data-media-id='{$media_item_id}'
                             data-media-url='{$uploaded_media_url}'
                             data-media-type='{$uploaded_media_type}'>{$view_button_text}</button>
                       </div>
@@ -1540,32 +1727,37 @@ if ($show_board_index) {
                         File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")
                       </span>
                     </div>
-                    <div id='media-container-{$post_element_id}-uploaded' class='media-container' style='display:none;'></div>";
+                    <div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
                 }
 
-                // Process Comment Media Links for Reply
-                $link_media_result = process_comment_media_links($cleaned_comment_content_raw, $post_element_id);
-                $cleaned_comment_content_raw = $link_media_result['cleaned_text'];
+                // 2. Process Comment Media Links for Reply
+                $comment_raw_from_db = $reply['comment'];
+                 // Passes $post_element_id so link IDs are unique per post/reply
+                $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
+                $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
                 $reply_media_buttons_html .= $link_media_result['media_html'];
 
-                // Format final reply comment
-                $formatted_comment = format_comment($cleaned_comment_content_raw);
+                // 3. Format final reply comment
+                $formatted_comment = format_comment($cleaned_comment_for_formatting);
+                // No truncation in thread view
 
               ?>
-                <div class="reply" id="post-<?php echo $reply_id; ?>">
+                <div class="reply" id="<?php echo $post_element_id; ?>"> <?php // Use $post_element_id ?>
                   <p class="post-info">
                     <span class="name">Anonymous</span>
                     <span class="time"><?php echo date('Y/m/d(D) H:i:s', strtotime($reply['created_at'])); ?></span>
                     <span class="post-id">No.<?php echo $reply_id; ?></span>
-                    <a href="#post-<?php echo $reply_id; ?>" class="reply-link" title="Link to this post">▶</a>
+                    <a href="#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a> <?php // Permalink for reply ?>
                   </p>
-                  <?php echo $reply_media_buttons_html; ?>
+
+                  <?php echo $reply_media_buttons_html; // Output reply's media buttons ?>
+
                   <div class="comment">
-                    <?php echo $formatted_comment; // No truncation in thread view ?>
+                    <?php echo $formatted_comment; // Output formatted reply comment ?>
                   </div>
                 </div>
               <?php endforeach; ?>
-            </div>
+            </div> <?php // End reply-container ?>
           </div><hr>
 
 
@@ -1591,7 +1783,7 @@ if ($show_board_index) {
                 </tr>
                 <tr>
                   <th></th>
-                  <td><input type="submit" value="Submit Thread"> <small>(Max: <?php echo MAX_FILE_SIZE / 1024 / 1024; ?> MB). Post Content or File required.</small></td>
+                  <td><input type="submit" value="Submit Thread"> <small>(Max: <?php echo MAX_FILE_SIZE / 1024 / 1024; ?> MB). Comment, File, or Media Link required.</small></td>
                 </tr>
               </table>
             </form>
@@ -1620,31 +1812,36 @@ if ($show_board_index) {
 
             <?php foreach ($threads as $thread):
               $thread_id = $thread['id'];
-              $post_element_id = 'post-' . $thread_id;
+               // Use the thread's ID for the post element ID
+              $post_element_id = 'post-' . $thread_id; // Unique ID for OP elements
 
               $thread_replies_preview = $replies_to_display[$thread_id] ?? [];
               $total_reply_count = $reply_counts[$thread_id] ?? 0;
               $omitted_count = max(0, $total_reply_count - count($thread_replies_preview)); // Ensure non-negative
 
-              $thread_media_buttons_html = '';
-              $cleaned_comment_content_raw = $thread['comment'];
+              $thread_media_buttons_html = ''; // Initialize for thread OP
+              $comment_raw_from_db = $thread['comment']; // Get raw comment
 
-              // Handle Uploaded File for Thread OP
+              // 1. Handle Uploaded File for Thread OP
               if ($thread['image']) {
+                $uploaded_media_local_path = UPLOADS_DIR . '/' . $thread['image'];
                 $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($thread['image']);
                 $orig_name = htmlspecialchars($thread['image_orig_name'] ?? $thread['image']);
                 $img_w = $thread['image_w'] ?? '?';
                 $img_h = $thread['image_h'] ?? '?';
-                $file_size = @filesize(UPLOADS_DIR . '/' . $thread['image']);
+                $file_size = @file_exists($uploaded_media_local_path) ? @filesize($uploaded_media_local_path) : 0;
                 $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
                 $uploaded_media_type = get_render_media_type($thread['image']);
                 $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
+                // Ensure uploaded media ID is unique using the post ID
+                $media_item_id = $post_element_id . '-uploaded'; // Unique ID for this uploaded media item
+
 
                 $thread_media_buttons_html .= "
                   <div class='file-info uploaded-file-info'>
                     <div class='media-toggle'>
                       <button class='show-media-btn'
-                          data-media-id='{$post_element_id}-uploaded'
+                          data-media-id='{$media_item_id}'
                           data-media-url='{$uploaded_media_url}'
                           data-media-type='{$uploaded_media_type}'>{$view_button_text}</button>
                     </div>
@@ -1652,41 +1849,41 @@ if ($show_board_index) {
                       File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")
                     </span>
                   </div>
-                  <div id='media-container-{$post_element_id}-uploaded' class='media-container' style='display:none;'></div>";
+                  <div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
               }
 
-              // Process Comment Media Links for Thread OP
-              $link_media_result = process_comment_media_links($cleaned_comment_content_raw, $post_element_id);
-              $cleaned_comment_content_raw = $link_media_result['cleaned_text'];
+              // 2. Process Comment Media Links for Thread OP
+              // Passes $post_element_id so link IDs are unique per post/reply
+              $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
+              $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
               $thread_media_buttons_html .= $link_media_result['media_html'];
 
-              // Format final comment
-              $formatted_comment = format_comment($cleaned_comment_content_raw);
-
-              // Handle text truncation for board view OP
+              // 3. Format final comment AND handle truncation for board view OP
+              $formatted_comment = format_comment($cleaned_comment_for_formatting);
               $display_comment_html = '';
-              // Use mb_strlen on the raw text *before* formatting for length check
-              if (mb_strlen($cleaned_comment_content_raw) > COMMENT_PREVIEW_LENGTH) {
-                // Truncate raw text, then format *both* parts
-                $truncated_raw_comment = mb_substr($cleaned_comment_content_raw, 0, COMMENT_PREVIEW_LENGTH);
-                $truncated_formatted_comment = format_comment($truncated_raw_comment); // Format truncated part
-                $full_formatted_comment = $formatted_comment; // Already have full formatted comment
+              // Use mb_strlen on the *cleaned* text (before formatting) for length check
+              if (mb_strlen($cleaned_comment_for_formatting) > COMMENT_PREVIEW_LENGTH) {
+                  // Truncate the cleaned text *before* formatting
+                  $truncated_cleaned_comment = mb_substr($cleaned_comment_for_formatting, 0, COMMENT_PREVIEW_LENGTH);
+                  // Format *both* the truncated and full versions
+                  $truncated_formatted_comment = format_comment($truncated_cleaned_comment);
+                  $full_formatted_comment = $formatted_comment; // Already have full formatted version
 
-                $display_comment_html = "
-                  <div class='comment-truncated'>
-                    {$truncated_formatted_comment}... <br>
-                    <button class='show-full-text-btn' data-target-id='full-comment-{$post_element_id}'>View Full Text</button>
-                  </div>
-                  <div id='full-comment-{$post_element_id}' class='comment-full'>
-                    {$full_formatted_comment}
-                  </div>";
+                  $display_comment_html = "
+                      <div class='comment-truncated'>
+                          {$truncated_formatted_comment}... <br>
+                          <button class='show-full-text-btn' data-target-id='full-comment-{$post_element_id}'>View Full Text</button>
+                      </div>
+                      <div id='full-comment-{$post_element_id}' class='comment-full'>
+                          {$full_formatted_comment}
+                      </div>";
               } else {
-                $display_comment_html = $formatted_comment; // No truncation needed
+                  $display_comment_html = $formatted_comment; // No truncation needed
               }
 
             ?>
               <div class="thread" id="thread-<?php echo $thread_id; ?>">
-                <div class="post op" id="post-<?php echo $thread_id; ?>">
+                <div class="post op" id="<?php echo $post_element_id; ?>"> <?php // Use $post_element_id ?>
                    <p class="post-info">
                     <?php if (!empty($thread['subject'])): ?>
                       <span class="subject"><?php echo htmlspecialchars($thread['subject']); ?></span>
@@ -1699,8 +1896,11 @@ if ($show_board_index) {
                     <?php if ($total_reply_count > 0): ?>
                       <span class="reply-count">(<?php echo $total_reply_count; ?> replies)</span>
                     <?php endif; ?>
+                     <a href="#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a> <?php // Permalink for OP ?>
                   </p>
-                  <?php echo $thread_media_buttons_html; ?>
+
+                  <?php echo $thread_media_buttons_html; // Output OP's media buttons ?>
+
                   <div class="comment">
                     <?php echo $display_comment_html; // Output truncated or full comment ?>
                   </div>
@@ -1740,27 +1940,31 @@ if ($show_board_index) {
                   <?php // Display preview replies
                   foreach ($thread_replies_preview as $reply):
                     $reply_id = $reply['id'];
-                    $post_element_id = 'post-' . $reply_id;
+                    // Use the reply's ID for the post element ID
+                    $post_element_id = 'post-' . $reply_id; // Unique ID for reply elements
 
-                    $reply_media_buttons_html = '';
-                    $cleaned_comment_content_raw = $reply['comment'];
+                    $reply_media_buttons_html = ''; // Initialize for reply
+                    $comment_raw_from_db = $reply['comment']; // Get raw comment
 
-                    // Handle Uploaded File for Reply Preview
+                    // 1. Handle Uploaded File for Reply Preview
                     if ($reply['image']) {
+                      $uploaded_media_local_path = UPLOADS_DIR . '/' . $reply['image'];
                       $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($reply['image']);
                       $orig_name = htmlspecialchars($reply['image_orig_name'] ?? $reply['image']);
                       $img_w = $reply['image_w'] ?? '?';
                       $img_h = $reply['image_h'] ?? '?';
-                      $file_size = @filesize(UPLOADS_DIR . '/' . $reply['image']);
+                      $file_size = @file_exists($uploaded_media_local_path) ? @filesize($uploaded_media_local_path) : 0;
                       $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
                       $uploaded_media_type = get_render_media_type($reply['image']);
                       $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
+                       // Ensure uploaded media ID is unique using the post ID
+                       $media_item_id = $post_element_id . '-uploaded'; // Unique ID for this uploaded media item
 
                       $reply_media_buttons_html .= "
                         <div class='file-info uploaded-file-info'>
                           <div class='media-toggle'>
                             <button class='show-media-btn'
-                                data-media-id='{$post_element_id}-uploaded'
+                                data-media-id='{$media_item_id}'
                                 data-media-url='{$uploaded_media_url}'
                                 data-media-type='{$uploaded_media_type}'>{$view_button_text}</button>
                           </div>
@@ -1768,22 +1972,21 @@ if ($show_board_index) {
                             File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")
                           </span>
                         </div>
-                        <div id='media-container-{$post_element_id}-uploaded' class='media-container' style='display:none;'></div>";
+                        <div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
                     }
 
-                    // Process Comment Media Links for Reply Preview
-                    $link_media_result = process_comment_media_links($cleaned_comment_content_raw, $post_element_id);
-                    $cleaned_comment_content_raw = $link_media_result['cleaned_text'];
+                    // 2. Process Comment Media Links for Reply Preview
+                    // Passes $post_element_id so link IDs are unique per post/reply
+                    $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
+                    $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
                     $reply_media_buttons_html .= $link_media_result['media_html'];
 
-                    // Format final comment
-                    $formatted_comment = format_comment($cleaned_comment_content_raw);
-
-                    // Handle text truncation for board view replies
+                    // 3. Format final comment AND handle truncation for board view replies
+                    $formatted_comment = format_comment($cleaned_comment_for_formatting);
                     $display_comment_html = '';
-                    if (mb_strlen($cleaned_comment_content_raw) > COMMENT_PREVIEW_LENGTH) {
-                      $truncated_raw_comment = mb_substr($cleaned_comment_content_raw, 0, COMMENT_PREVIEW_LENGTH);
-                      $truncated_formatted_comment = format_comment($truncated_raw_comment);
+                    if (mb_strlen($cleaned_comment_for_formatting) > COMMENT_PREVIEW_LENGTH) {
+                      $truncated_cleaned_comment = mb_substr($cleaned_comment_for_formatting, 0, COMMENT_PREVIEW_LENGTH);
+                      $truncated_formatted_comment = format_comment($truncated_cleaned_comment);
                       $full_formatted_comment = $formatted_comment;
 
                       $display_comment_html = "
@@ -1799,14 +2002,17 @@ if ($show_board_index) {
                     }
 
                     ?>
-                    <div class="reply" id="post-<?php echo $reply_id; ?>">
+                    <div class="reply" id="<?php echo $post_element_id; ?>"> <?php // Use $post_element_id ?>
                       <p class="post-info">
                         <span class="name">Anonymous</span>
                         <span class="time"><?php echo date('Y/m/d(D) H:i:s', strtotime($reply['created_at'])); ?></span>
                         <span class="post-id">No.<?php echo $reply_id; ?></span>
-                        <a href="./?channel=<?php echo urlencode($current_channel_code); ?>&thread=<?php echo $thread_id; ?>#post-<?php echo $reply_id; ?>" class="reply-link" title="Link to this post">▶</a>
+                        <?php // Link to the post within the full thread view ?>
+                        <a href="./?channel=<?php echo urlencode($current_channel_code); ?>&thread=<?php echo $thread_id; ?>#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a>
                       </p>
-                      <?php echo $reply_media_buttons_html; ?>
+
+                      <?php echo $reply_media_buttons_html; // Output reply's media buttons ?>
+
                       <div class="comment">
                         <?php echo $display_comment_html; // Output truncated or full reply comment ?>
                       </div>
