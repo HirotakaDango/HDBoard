@@ -1,0 +1,5 @@
+# Turn on the rewrite engine
+RewriteEngine On
+
+RewriteCond %{REQUEST_URI} ^/board\.db$
+RewriteRule ^ /denied.php [L]
