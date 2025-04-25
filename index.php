@@ -1795,7 +1795,7 @@ if ($show_board_index) {
                  </tr>
                  <tr>
                    <th></th>
-                   <td><input type="submit" value="Submit Thread"> <small>(Max: <?php echo MAX_FILE_SIZE / 1024 / 1024; ?> MB). Comment/File/Link required.</small></td>
+                   <td><input type="submit" value="Submit Thread"> <small>(Max: <?php echo MAX_FILE_SIZE / 1024 / 1024; ?> MB)</small></td>
                  </tr>
               </table>
             </form>
