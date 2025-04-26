@@ -41,11 +41,6 @@ You can edit `index.php` directly to modify:
 - Posting rules
 - Appearance and styles
 
-## Usage
-
-1. Users can post messages via a simple form.
-2. Posts are stored in plain text or as files.
-3. Displayed posts are dynamically rendered.
 
 ## Folder Structure
 
