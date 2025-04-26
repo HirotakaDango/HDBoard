@@ -105,7 +105,7 @@ try {
   $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
   $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
 
-  // Create/Update threads table
+  // Create/Update tables (Keeping this as is from original)
   $db->exec("CREATE TABLE IF NOT EXISTS threads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel TEXT NOT NULL,
@@ -121,7 +121,6 @@ try {
     last_reply_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )");
 
-  // Create/Update replies table
   $db->exec("CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id INTEGER NOT NULL,
@@ -136,7 +135,7 @@ try {
     FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
   )");
 
-  // Add columns if they don't exist
+  // Add columns if they don't exist (Keeping this as is)
   function addColumnIfNotExists(PDO $db, string $tableName, string $columnName, string $columnDefinition) {
     try {
       $stmt = $db->query("PRAGMA table_info($tableName)");
@@ -162,7 +161,7 @@ try {
   die("Database Connection/Setup Error: " . $e->getMessage());
 }
 
-// --- Functions ---
+// --- Functions (Keeping these as is) ---
 
 /**
  * Handles file uploads, placing them in dated subdirectories.
@@ -199,6 +198,7 @@ function handle_upload($file_input_name) {
   }
 
   // --- Get Image Dimensions ---
+  // Only attempt for actual image types
   $img_w = null; $img_h = null;
   if (in_array($extension, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) {
     $image_size = @getimagesize($file['tmp_name']);
@@ -221,10 +221,11 @@ function handle_upload($file_input_name) {
       return ['error' => 'Server error: Could not create upload directory.'];
     }
   }
-  if (!is_writable($target_dir)) {
-    error_log("Error: Dated upload directory is not writable: " . $target_dir);
-    return ['error' => 'Server error: Upload directory is not writable.'];
+  if (!is_writable(UPLOADS_DIR . '/' . $relative_dir_path)) { // Check the specific dated dir is writable
+      error_log("Error: Dated upload directory is not writable: " . $target_dir);
+      return ['error' => 'Server error: Upload directory is not writable.'];
   }
+
 
   // --- Generate Filename and Destination ---
   $new_filename_base = uniqid() . time(); // Base name without extension
@@ -256,6 +257,7 @@ function handle_upload($file_input_name) {
  * Determines the media type for rendering based on URL or filename.
  */
 function get_render_media_type($url_or_filename) {
+  if (!$url_or_filename) return 'unknown';
   // YouTube check
   $youtube_regex = '/^https?:\/\/(?:www\.)?(?:m\.)?(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})(?:[?&].*)?$/i';
   if (preg_match($youtube_regex, $url_or_filename)) {
@@ -267,8 +269,8 @@ function get_render_media_type($url_or_filename) {
   if (in_array($extension, VIDEO_EXTENSIONS)) return 'video';
   if (in_array($extension, AUDIO_EXTENSIONS)) return 'audio';
 
-  // Local filename check
-  if (!preg_match('/^https?:\/\//', $url_or_filename)) {
+  // Local filename check (if not starting with http/s/ftp, assume it's a local upload path)
+  if (!preg_match('/^https?:\/\//', $url_or_filename) && !preg_match('/^ftp:\/\//', $url_or_filename)) {
     $local_extension = strtolower(pathinfo($url_or_filename, PATHINFO_EXTENSION));
     if (in_array($local_extension, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) return 'image';
     if (in_array($local_extension, VIDEO_EXTENSIONS)) return 'video';
@@ -286,22 +288,27 @@ function format_comment($comment) {
   $comment = (string) ($comment ?? '');
   // 1. Sanitize HTML
   $comment = htmlspecialchars($comment, ENT_QUOTES, 'UTF-8');
-  // 2. Linkify URLs
+  // 2. Linkify URLs (Exclude URLs already within a tag like href or src)
   $comment = preg_replace_callback(
-    '/(?<![\'"])(?<![=\/])(https?|ftp):\/\/([^\s<>"\'`]+)/i',
+    '/(?<![\'"])(?<![=\/])\b(https?|ftp):\/\/([^\s<>"\'`]+)/i', // Added \b word boundary
     function ($matches) {
       $url = $matches[0];
+      // Decode for display, handle special chars safely
       $decoded_display = htmlspecialchars_decode($matches[2], ENT_QUOTES);
+      // Shorten display if too long
       $display_url = (mb_strlen($decoded_display) > 50) ? mb_substr($decoded_display, 0, 47) . '...' : $decoded_display;
-      return '<a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars(urldecode($matches[1] . '://' . $display_url), ENT_QUOTES, 'UTF-8') . '</a>';
+      // Ensure URL is valid and escaped for href attribute
+      $safe_url = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
+      // Display URL is shown decoded but HTML escaped for display within the link text
+      return '<a href="' . $safe_url . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars(urldecode($matches[1] . '://' . $display_url), ENT_QUOTES, 'UTF-8') . '</a>';
     },
     $comment
   );
   // 3. nl2br
   $comment = nl2br($comment, false);
-  // 4. Greentext
-  $comment = preg_replace('/(^<br>|^\s*)(>[^>].*?)$/m', '$1<span class="greentext">$2</span>', $comment);
-  $comment = preg_replace('/(^\s*)(>[^>].*?)$/m', '$1<span class="greentext">$2</span>', $comment);
+  // 4. Greentext (apply after nl2br to handle line breaks correctly)
+  $comment = preg_replace('/(^<br\s*\/?>|\n|^)(>[^<].*?)$/m', '$1<span class="greentext">$2</span>', $comment); // Handles <br> or newline starting line
+  $comment = preg_replace('/(^\s*)(>[^<].*?)$/m', '$1<span class="greentext">$2</span>', $comment); // For lines not starting with <br> or newline (first line)
   // 5. Reply Links (>>123)
   $comment = preg_replace('/>>(\d+)/', '<a href="#post-$1" class="reply-mention">>>$1</a>', $comment);
   return $comment;
@@ -314,9 +321,11 @@ function process_comment_media_links($text, $post_element_id) {
   $media_html = '';
   $cleaned_text = $text;
   $link_counter = 0;
-  $url_regex = '/(?<!src=["\'])(?<!href=["\'])(https?|ftp):\/\/[^\s<>"]+/i';
+  // Regex to find URLs that are NOT already part of an img src or a href attribute
+  $url_regex = '/(?<!src=["\'])(?<!href=["\'])(?<!data-media-url=["\'])\b(https?|ftp):\/\/[^\s<>"]+/i'; // Added check for data-media-url
 
   if (preg_match_all($url_regex, $text, $matches, PREG_OFFSET_CAPTURE)) {
+    // Process matches in reverse order to handle offsets correctly after removing
     $matches_reversed = array_reverse($matches[0]);
     $media_items_to_append = [];
 
@@ -327,10 +336,12 @@ function process_comment_media_links($text, $post_element_id) {
 
       if ($render_type !== 'unknown') {
         $media_items_to_append[] = ['url' => $url, 'render_type' => $render_type];
-        $cleaned_text = substr_replace($cleaned_text, '', $offset, strlen($url));
+        // Remove the media URL from the original text
+        $cleaned_text = mb_substr($cleaned_text, 0, $offset) . mb_substr($cleaned_text, $offset + mb_strlen($url));
       }
     }
 
+    // Generate HTML for media items found
     foreach (array_reverse($media_items_to_append) as $item) {
       $link_counter++;
       $media_id = $post_element_id . '-link-' . $link_counter;
@@ -382,102 +393,131 @@ if (!$show_board_index) {
 $post_error = null;
 $post_success = null;
 
+// Only process POST if we are on a valid channel page (not board index)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST['comment'])) {
   $comment_raw = trim($_POST['comment'] ?? '');
   $subject = trim($_POST['subject'] ?? '');
   $thread_id = filter_input(INPUT_POST, 'thread_id', FILTER_VALIDATE_INT);
+  // The channel code must match the current page's channel code for security
   $posted_channel_code = trim($_POST['channel'] ?? '');
 
-  // --- Username and Password Handling ---
-  $input_username = trim($_POST['username'] ?? '');
-  $input_password = $_POST['password'] ?? ''; // Keep raw password for verification check
-  $db_username_to_store = null;
-  $db_password_hash_to_store = null; // Will store hash ONLY on registration
+  // Basic validation first
+  if (empty($posted_channel_code) || $posted_channel_code !== $current_channel_code) {
+       $post_error = "Invalid channel specified for post.";
+  }
 
-  // Validate username length first
-  if (mb_strlen($input_username) > USERNAME_MAX_LENGTH) {
-    $post_error = "Username is too long (max " . USERNAME_MAX_LENGTH . " characters).";
-  } elseif (!empty($input_username)) {
-    // Username provided, check registration status and password
-    $existing_hash = null;
-    try {
-      // Find the first post (thread or reply) by this user that has a password hash set.
-      // Ordering by ID DESC ensures we get the registration post if multiple exist.
-      $stmt_check = $db->prepare("
-        SELECT password_hash FROM (
-          SELECT password_hash, id FROM threads WHERE username = ? AND password_hash IS NOT NULL
-          UNION ALL
-          SELECT password_hash, thread_id AS id FROM replies WHERE username = ? AND password_hash IS NOT NULL
-        ) AS user_posts
-        ORDER BY id DESC
-        LIMIT 1
-      ");
-      // Consider COLLATE NOCASE for case-insensitivity: WHERE username = ? COLLATE NOCASE
-      $stmt_check->execute([$input_username, $input_username]);
-      $result = $stmt_check->fetch();
-      $existing_hash = $result ? $result['password_hash'] : null; // This is the hash stored during registration
+  // --- Username and Password Handling (Only proceed if channel is valid) ---
+  if ($post_error === null) {
+      $input_username = trim($_POST['username'] ?? '');
+      $input_password = $_POST['password'] ?? ''; // Keep raw password for verification check
+      $db_username_to_store = null;
+      $db_password_hash_to_store = null; // Will store hash ONLY on registration
 
-    } catch (PDOException $e) {
-      error_log("Username check failed for '{$input_username}': " . $e->getMessage());
-      $post_error = "Database error during username check.";
-    }
+      // Validate username length first
+      if (mb_strlen($input_username) > USERNAME_MAX_LENGTH) {
+        $post_error = "Username is too long (max " . USERNAME_MAX_LENGTH . " characters).";
+      } elseif (!empty($input_username)) {
+        // Username provided, check registration status and password
+        $existing_hash = null;
+        try {
+          // Find the first post (thread or reply) by this user that has a password hash set.
+          // Ordering by ID DESC ensures we get the registration post if multiple exist.
+          // Using UNION ALL and sorting effectively simulates searching across both tables for the latest registration.
+          $stmt_check = $db->prepare("
+            SELECT password_hash FROM (
+              SELECT password_hash FROM threads WHERE username = ? AND password_hash IS NOT NULL
+              UNION ALL
+              SELECT password_hash FROM replies WHERE username = ? AND password_hash IS NOT NULL
+            ) AS user_posts
+            LIMIT 1
+          ");
+          // Consider COLLATE NOCASE for case-insensitivity: WHERE username = ? COLLATE NOCASE
+          $stmt_check->execute([$input_username, $input_username]);
+          $result = $stmt_check->fetch();
+          $existing_hash = $result ? $result['password_hash'] : null; // This is the hash stored during registration
 
-    if ($post_error === null) { // Proceed only if DB check didn't fail
-      if ($existing_hash !== null) {
-        // Username is REGISTERED
-        if (empty($input_password)) {
-          $post_error = "Password required for registered username '" . htmlspecialchars($input_username) . "'.";
-        } elseif (!password_verify($input_password, $existing_hash)) {
-          // Password provided, but it's incorrect
-          $post_error = "Invalid password for username '" . htmlspecialchars($input_username) . "'.";
-        } else {
-          // Password is correct! User is verified for this post.
-          $db_username_to_store = $input_username;
-          // Do NOT store the hash again. Store NULL for subsequent posts.
-          $db_password_hash_to_store = null;
+        } catch (PDOException $e) {
+          error_log("Username check failed for '{$input_username}': " . $e->getMessage());
+          $post_error = "Database error during username check.";
         }
-      } else {
-        // Username is NOT REGISTERED (or only used without password before)
-        if (empty($input_password)) {
-          // Require password for first-time use of a name to register it
-          $post_error = "Password is required to register the username '" . htmlspecialchars($input_username) . "'. Leave both blank to post anonymously.";
-        } else {
-          // First time use WITH a password - Register!
-          $db_username_to_store = $input_username;
-          // Hash the password and store it THIS TIME ONLY.
-          $db_password_hash_to_store = password_hash($input_password, PASSWORD_DEFAULT);
-          if ($db_password_hash_to_store === false) {
-            $post_error = "Failed to process password during registration.";
-            error_log("password_hash() failed during registration for '{$input_username}'.");
+
+        if ($post_error === null) { // Proceed only if DB check didn't fail
+          if ($existing_hash !== null) {
+            // Username is REGISTERED (found an existing password hash)
+            if (empty($input_password)) {
+              $post_error = "Password required for registered username '" . htmlspecialchars($input_username) . "'.";
+            } elseif (!password_verify($input_password, $existing_hash)) {
+              // Password provided, but it's incorrect
+              $post_error = "Invalid password for username '" . htmlspecialchars($input_username) . "'.";
+            } else {
+              // Password is correct! User is verified for this post.
+              $db_username_to_store = $input_username;
+              // Do NOT store the hash again. Store NULL for subsequent posts.
+              $db_password_hash_to_store = null;
+            }
+          } else {
+            // Username is NOT REGISTERED (or only used without password before)
+            if (empty($input_password)) {
+              // Allow posting with a username but no password (they won't be registered, username is just a tag)
+               $db_username_to_store = $input_username;
+               $db_password_hash_to_store = null; // No hash stored for non-registered use
+            } else {
+              // First time use WITH a password - Register!
+              $db_username_to_store = $input_username;
+              // Hash the password and store it THIS TIME ONLY.
+              $db_password_hash_to_store = password_hash($input_password, PASSWORD_DEFAULT);
+              if ($db_password_hash_to_store === false) {
+                $post_error = "Failed to process password during registration.";
+                error_log("password_hash() failed during registration for '{$input_username}'.");
+              }
+            }
           }
         }
+      } else {
+        // Username field is empty, post anonymously
+        $db_username_to_store = null;
+        $db_password_hash_to_store = null;
       }
-    }
-  } else {
-    // Username field is empty, post anonymously
-    $db_username_to_store = null;
-    $db_password_hash_to_store = null;
   }
+
 
   // --- Continue with the rest of the POST validation ONLY if $post_error is still null ---
   if ($post_error === null) {
-    if (!$thread_id && $posted_channel_code !== $current_channel_code) {
-      $post_error = "Channel mismatch detected.";
-    } else {
-      // Content check
+    // Check channel consistency if thread_id is provided (already done implicitly by check against $current_channel_code, but keep for clarity)
+    if ($thread_id) {
+       try {
+         $stmt_check_thread_channel = $db->prepare("SELECT channel FROM threads WHERE id = ?");
+         $stmt_check_thread_channel->execute([$thread_id]);
+         $thread_channel_data = $stmt_check_thread_channel->fetch();
+         if (!$thread_channel_data) {
+            $post_error = "Thread not found.";
+         } elseif ($thread_channel_data['channel'] !== $current_channel_code) {
+            $post_error = "Attempting to reply to a thread from the wrong channel page.";
+         }
+       } catch (PDOException $e) {
+          error_log("Database error checking thread channel for reply: " . $e->getMessage());
+          $post_error = "Database error verifying thread.";
+       }
+    }
+
+    if ($post_error === null) { // Proceed only if thread channel check passed
+      // Content check (after username/password is handled)
       $temp_media_check = process_comment_media_links($comment_raw, 'temp-validation');
       $has_text_content = !empty(trim($temp_media_check['cleaned_text']));
       $has_media_links = !empty($temp_media_check['media_html']);
       $has_file = isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE;
 
-      if (!$has_text_content && !$has_media_links && !$has_file) {
-        $post_error = "A comment, a file, or media links are required.";
+      // Only allow posting if we are on a board page or a thread page
+      if ($show_board_index) { // Should not happen due to initial check, but double-check
+           $post_error = "Cannot post from the board index.";
+      } elseif (!$thread_id && empty($comment_raw) && !$has_file && !$has_media_links) {
+          // New thread requires at least comment, file, or media link
+          $post_error = "A comment, a file, or media links are required for a new thread.";
+      } elseif ($thread_id && empty($comment_raw) && !$has_file && !$has_media_links) {
+          // Reply requires at least comment, file, or media link
+          $post_error = "A comment, a file, or media links are required for a reply.";
       } elseif (mb_strlen($comment_raw) > 4000) {
         $post_error = "Post content is too long (max 4000 characters).";
-      } elseif (!$thread_id && empty($posted_channel_code)) {
-        $post_error = "Channel not specified for new thread.";
-      } elseif (!$thread_id && !in_array($posted_channel_code, ALLOWED_CHANNELS)) {
-        $post_error = "Invalid channel specified.";
       } else {
         // Handle file upload
         $upload_result = handle_upload('image');
@@ -494,21 +534,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
             $image_w = $upload_result['width'] ?? null;
             $image_h = $upload_result['height'] ?? null;
 
-            // Final content check again (redundant but safe)
-            if (!$has_file && !$has_text_content && !$has_media_links) {
+            // Final content check again (redundant but safe, using the actual file status)
+            if ($image_relative_path === null && !$has_text_content && !$has_media_links) {
               $db->rollBack();
+              // This case should be caught by the earlier check now, but leaving this for safety
               $post_error = "A comment, a file, or media links are required.";
             } else {
               if ($thread_id) { // Posting a Reply
-                $stmt_check_thread = $db->prepare("SELECT id, channel FROM threads WHERE id = ?");
-                $stmt_check_thread->execute([$thread_id]);
-                $thread_data = $stmt_check_thread->fetch();
-
-                if ($thread_data) {
-                  if ($thread_data['channel'] !== $current_channel_code) {
-                    $db->rollBack();
-                    $post_error = "Attempting to reply to a thread from the wrong channel page.";
-                  } else {
                     // Insert reply using calculated username/hash
                     $stmt = $db->prepare("INSERT INTO replies (thread_id, username, password_hash, comment, image, image_orig_name, image_w, image_h) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
                     $stmt->execute([
@@ -521,20 +553,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
                     ]);
                     $new_post_id = $db->lastInsertId();
 
+                    // Update last_reply_at for the thread
                     $stmt_update = $db->prepare("UPDATE threads SET last_reply_at = CURRENT_TIMESTAMP WHERE id = ?");
                     $stmt_update->execute([$thread_id]);
 
                     $db->commit();
                     // Redirect
-                    $redirect_params = ['channel' => $thread_data['channel'], 'thread' => $thread_id];
+                    // Use the validated thread channel code for the redirect
+                    $redirect_params = ['channel' => $current_channel_code, 'thread' => $thread_id];
+                    // Add a timestamp to bust cache on some browsers, and include the new post ID in hash
                     $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time() . '#post-' . $new_post_id;
                     header("Location: " . $redirect_url);
                     exit;
-                  }
-                } else {
-                  $post_error = "Thread not found.";
-                  $db->rollBack();
-                }
+
               } else { // Posting a New Thread
                 // Insert new thread using calculated username/hash
                 $stmt = $db->prepare("INSERT INTO threads (channel, username, password_hash, subject, comment, image, image_orig_name, image_w, image_h) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -551,6 +582,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
                 $db->commit();
                 // Redirect
                 $redirect_params = ['channel' => $current_channel_code];
+                 // Add a timestamp to bust cache on some browsers
                 $redirect_url = './?' . http_build_query($redirect_params) . '&ts=' . time();
                 header("Location: " . $redirect_url);
                 exit;
@@ -565,7 +597,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$show_board_index && isset($_POST[
           }
         } // End upload success check
       } // End basic validation checks
-    } // End channel mismatch check
+    } // End thread channel mismatch check (only applies if thread_id was set)
   } // End initial $post_error === null check (username/password validation)
 } // End POST request handling
 
@@ -592,72 +624,102 @@ if ($show_board_index) {
       $reply_count_stmt->execute([$channel_code]); $reply_count = $reply_count_stmt->fetchColumn();
       $board_index_data[$channel_code] = ['code' => $channel_code, 'name' => $display_name, 'total_posts' => $thread_count + $reply_count];
     }
-    // Order the board_index_data
+    // Order the board_index_data according to channel categories
     $ordered_board_index_data = [];
-    foreach ($channel_categories as $category_channels) { foreach ($category_channels as $channel_code) { if (isset($board_index_data[$channel_code])) { $ordered_board_index_data[$channel_code] = $board_index_data[$channel_code]; } } }
-    foreach (ALLOWED_CHANNELS as $channel_code) { if (!isset($ordered_board_index_data[$channel_code]) && isset($board_index_data[$channel_code])) { $ordered_board_index_data[$channel_code] = $board_index_data[$channel_code]; } }
+    foreach ($channel_categories as $category_name => $category_channels) {
+      foreach ($category_channels as $channel_code) {
+        if (isset($board_index_data[$channel_code])) {
+          $ordered_board_index_data[$channel_code] = $board_index_data[$channel_code];
+        } else {
+           // Log a warning if a channel listed in categories isn't in ALLOWED_CHANNELS
+           if (!in_array($channel_code, ALLOWED_CHANNELS)) {
+              error_log("Warning: Channel code '{$channel_code}' listed in categories is not in ALLOWED_CHANNELS.");
+           } else {
+               // Should not happen if ALLOWED_CHANNELS and categories are consistent
+               error_log("Warning: Channel code '{$channel_code}' in categories unexpectedly missing from board_index_data.");
+           }
+        }
+      }
+    }
+    // Add any ALLOWED_CHANNELS that weren't in categories (should be none if categories are exhaustive)
+    foreach (ALLOWED_CHANNELS as $channel_code) {
+      if (!isset($ordered_board_index_data[$channel_code]) && isset($board_index_data[$channel_code])) {
+         $ordered_board_index_data[$channel_code] = $board_index_data[$channel_code];
+      }
+    }
     $board_index_data = $ordered_board_index_data;
+
 
   } catch (PDOException $e) { error_log("Database Fetch Error (Board Index Cards): " . $e->getMessage()); die("Database Fetch Error: " . $e->getMessage()); }
 
 } else {
-  // --- Channel/Thread View ---
+  // --- Channel or Thread View ---
   try {
     if ($viewing_thread_id) {
       // --- Thread View ---
-      $stmt = $db->prepare("SELECT *, username FROM threads WHERE id = ? AND channel = ?");
+      $stmt = $db->prepare("SELECT id, channel, username, subject, comment, image, image_orig_name, image_w, image_h, created_at FROM threads WHERE id = ? AND channel = ?");
       $stmt->execute([$viewing_thread_id, $current_channel_code]);
       $thread_op = $stmt->fetch();
 
       if ($thread_op) {
-        $replies_stmt = $db->prepare("SELECT *, username FROM replies WHERE thread_id = ? ORDER BY created_at ASC");
+        $replies_stmt = $db->prepare("SELECT id, thread_id, username, comment, image, image_orig_name, image_w, image_h, created_at FROM replies WHERE thread_id = ? ORDER BY created_at ASC");
         $replies_stmt->execute([$viewing_thread_id]);
         $replies_to_display[$viewing_thread_id] = $replies_stmt->fetchAll();
         $reply_counts[$viewing_thread_id] = count($replies_to_display[$viewing_thread_id]);
-        $threads = [$thread_op];
+        $threads = [$thread_op]; // Put the single thread into the $threads array for consistent rendering loop below
       } else {
         $post_error = "Thread with ID " . htmlspecialchars($viewing_thread_id) . " not found in channel /" . htmlspecialchars($current_channel_code) . "/.";
-        $viewing_thread_id = null; // Fallback to board view
+        // No explicit fallback needed, the page will render with the error message and no threads/replies below.
       }
     }
 
-    // --- Board View (or fallback) ---
-    if (!$viewing_thread_id) {
+    // --- Board View (or initial load if $viewing_thread_id is null) ---
+    // This block runs *regardless* of whether $viewing_thread_id was set, allowing the page to
+    // render board view if a thread ID is missing or invalid.
+    if (!$viewing_thread_id) { // Only fetch threads/pagination for board view
       $current_page = max(1, filter_input(INPUT_GET, 'page', FILTER_VALIDATE_INT) ?: 1);
       $count_stmt = $db->prepare("SELECT COUNT(*) FROM threads WHERE channel = ?");
       $count_stmt->execute([$current_channel_code]);
       $total_threads = $count_stmt->fetchColumn();
       $total_pages = max(1, ceil($total_threads / THREADS_PER_PAGE));
-      $current_page = min($current_page, $total_pages);
+      $current_page = min($current_page, $total_pages); // Ensure current page is not beyond total pages
       $offset = ($current_page - 1) * THREADS_PER_PAGE;
 
-      // Fetch threads
-      $threads_stmt = $db->prepare("SELECT *, username FROM threads WHERE channel = ? ORDER BY last_reply_at DESC LIMIT ? OFFSET ?");
+      // Fetch threads for the current page, ordered by last reply time
+      $threads_stmt = $db->prepare("SELECT id, channel, username, subject, comment, image, image_orig_name, image_w, image_h, created_at FROM threads WHERE channel = ? ORDER BY last_reply_at DESC LIMIT ? OFFSET ?");
       $threads_stmt->bindValue(1, $current_channel_code, PDO::PARAM_STR);
       $threads_stmt->bindValue(2, THREADS_PER_PAGE, PDO::PARAM_INT);
       $threads_stmt->bindValue(3, $offset, PDO::PARAM_INT);
       $threads_stmt->execute();
       $threads = $threads_stmt->fetchAll();
 
-      // Fetch reply previews/counts
+      // Fetch reply previews/counts for the threads on the current page
       $threads_on_page_ids = array_column($threads, 'id');
       if (!empty($threads_on_page_ids)) {
         $placeholders = implode(',', array_fill(0, count($threads_on_page_ids), '?'));
+
+        // Fetch counts for all replies to these threads
         $count_stmt = $db->prepare("SELECT thread_id, COUNT(*) as count FROM replies WHERE thread_id IN ($placeholders) GROUP BY thread_id");
         $count_stmt->execute($threads_on_page_ids);
         $reply_counts = $count_stmt->fetchAll(PDO::FETCH_KEY_PAIR);
 
+        // Fetch ALL replies for threads on the page (needed to get the LAST N replies)
         $all_replies_for_page = [];
-        $replies_stmt = $db->prepare("SELECT *, username FROM replies WHERE thread_id IN ($placeholders) ORDER BY created_at ASC");
+        $replies_stmt = $db->prepare("SELECT id, thread_id, username, comment, image, image_orig_name, image_w, image_h, created_at FROM replies WHERE thread_id IN ($placeholders) ORDER BY created_at ASC");
         $replies_stmt->execute($threads_on_page_ids);
-        while ($reply = $replies_stmt->fetch()) { $all_replies_for_page[$reply['thread_id']][] = $reply; }
+        while ($reply = $replies_stmt->fetch()) {
+            $all_replies_for_page[$reply['thread_id']][] = $reply;
+        }
 
+        // Slice the last REPLIES_PREVIEW_COUNT for each thread
         foreach ($all_replies_for_page as $tid => $thread_replies) {
           $start_index = max(0, count($thread_replies) - REPLIES_PREVIEW_COUNT);
           $replies_to_display[$tid] = array_slice($thread_replies, $start_index);
         }
       }
     }
+     // Note: If $viewing_thread_id was valid, $threads already contains the OP and $replies_to_display[$viewing_thread_id]
+     // contains all replies. The code flow below handles this correctly.
   } catch (PDOException $e) { error_log("Database Fetch Error (Channel/Thread): " . $e->getMessage()); die("Database Fetch Error: " . $e->getMessage()); }
 }
 ?>
@@ -828,12 +890,49 @@ if ($show_board_index) {
       .nsfw-warning-close:hover {
         color: var(--text-color);
       }
-      .post-form, .reply-form-container {
+      .post-form { /* This is the outer container for the new thread form */
         background-color: var(--form-bg);
         border: 1px solid var(--border-color);
         padding: 15px;
         margin-bottom: 20px;
       }
+      .post-form h2 { /* Style the H2 */
+          margin: 0 0 10px 0;
+          color: var(--accent-blue);
+          font-size: 1.2em;
+          display: inline-block; /* To align button next to it */
+          vertical-align: middle;
+      }
+      .post-form .toggle-button { /* Style the toggle button */
+          padding: 4px 10px;
+          font-size: 0.9em;
+          cursor: pointer;
+          background-color: var(--button-bg);
+          color: var(--button-text);
+          border: 1px solid var(--input-border);
+          border-radius: 3px;
+          margin-left: 10px;
+          vertical-align: middle;
+          transition: background-color 0.2s ease;
+      }
+      .post-form .toggle-button:hover {
+          background-color: var(--button-hover-bg);
+      }
+      .post-form-content { /* The div that contains the collapsible form */
+          /* Initial state is handled by JS/default CSS if needed */
+          margin-top: 10px; /* Add some space below the title/button */
+          padding-top: 10px;
+          border-top: 1px dashed var(--border-color);
+      }
+      .reply-form-container { /* This is for the per-thread quick reply forms */
+         background-color: var(--form-bg);
+        border: 1px solid var(--border-color);
+        padding: 15px;
+        margin-top: 10px; /* Adjusted margin */
+        margin-bottom: 10px; /* Adjusted margin */
+      }
+
+      /* Form table styles */
       .post-form table, .reply-form-container table {
         border-collapse: collapse;
         width: 100%;
@@ -1067,15 +1166,21 @@ if ($show_board_index) {
         overflow: hidden;
         background-color: var(--bg-color);
       }
-      .media-container img, .media-container video, .media-container audio, .media-container iframe {
+      .media-container img, .media-container video, .media-container iframe {
         display: block;
         max-width: 100%;
         height: auto;
         margin: 0 auto;
         background-color: #000;
       }
+      /* Specific rule for audio player - Adjusted */
       .media-container audio {
-        width: 100%;
+        display: block;
+        width: 100%; /* Audio players often look better spanning full width */
+        min-height: 30px; /* Ensure it has a minimum height even if browser default is small */
+        height: auto; /* Let browser default height apply */
+        margin: 0 auto;
+        /* Removed background-color: #000; to avoid hiding default controls */
       }
       .youtube-embed-container, .video-embed-container {
         margin: 5px 0;
@@ -1368,6 +1473,14 @@ if ($show_board_index) {
       }
     </style>
     <script>
+      // Pass current channel code to JavaScript if on a channel page
+      <?php if (!$show_board_index): ?>
+        const currentChannel = "<?php echo htmlspecialchars($current_channel_code); ?>";
+      <?php else: ?>
+        const currentChannel = null; // Not on a channel page
+      <?php endif; ?>
+    </script>
+    <script>
       const IMAGE_TYPES = ['image'];
       const VIDEO_TYPES = ['video'];
       const AUDIO_TYPES = ['audio'];
@@ -1414,46 +1527,125 @@ if ($show_board_index) {
         if (isHidden) {
           mediaContainer.style.display = 'block';
           button.textContent = hideButtonText;
-          if (mediaContainer.innerHTML.trim() === '' || mediaContainer.dataset.loadedUrl !== mediaUrl) {
-            mediaContainer.innerHTML = '<span>Loading...</span>';
-            mediaContainer.dataset.loadedUrl = mediaUrl;
-            let mediaElementHTML = '';
+
+          // Check if content is already loaded and the URL matches
+          // Clearing and re-appending for audio/video might help ensure player visibility
+          const loadedUrl = mediaContainer.dataset.loadedUrl;
+          const mediaElementExists = mediaContainer.querySelector('video, audio, iframe, img');
+          const needsLoad = !loadedUrl || loadedUrl !== mediaUrl || !mediaElementExists;
+
+          if (needsLoad) {
+            // Clear any existing content first
+             mediaContainer.innerHTML = '<span>Loading...</span>'; // Placeholder
+            mediaContainer.dataset.loadedUrl = mediaUrl; // Store the URL that was loaded
+
+            let mediaElement = null;
 
             if (IMAGE_TYPES.includes(mediaType)) {
-              mediaElementHTML = `<a href="${mediaUrl}" target="_blank" rel="noopener noreferrer"><img src="${mediaUrl}" alt="Media Image" loading="lazy"></a>`;
+              mediaElement = document.createElement('img');
+              mediaElement.src = mediaUrl;
+              mediaElement.alt = 'Media Image';
+              mediaElement.loading = 'lazy';
+              const linkElement = document.createElement('a');
+              linkElement.href = mediaUrl;
+              linkElement.target = '_blank';
+              linkElement.rel = 'noopener noreferrer';
+              linkElement.appendChild(mediaElement);
+              mediaContainer.innerHTML = ''; // Clear placeholder
+              mediaContainer.appendChild(linkElement);
+
             } else if (VIDEO_TYPES.includes(mediaType)) {
-              mediaElementHTML = `<div class="video-embed-container"><video src="${mediaUrl}" controls playsinline preload="metadata"></video></div>`;
+              mediaElement = document.createElement('video');
+              mediaElement.src = mediaUrl;
+              mediaElement.controls = true;
+              mediaElement.playsinline = true;
+              mediaElement.preload = 'metadata'; // or 'auto'
+              const embedContainer = document.createElement('div');
+              embedContainer.classList.add('video-embed-container');
+              embedContainer.appendChild(mediaElement);
+              mediaContainer.innerHTML = ''; // Clear placeholder
+              mediaContainer.appendChild(embedContainer);
+
             } else if (AUDIO_TYPES.includes(mediaType)) {
-              mediaElementHTML = `<audio src="${mediaUrl}" controls preload="metadata"></audio>`;
+              // Create and configure the audio element
+              mediaElement = document.createElement('audio');
+              mediaElement.src = mediaUrl;
+              mediaElement.controls = true; // This should show the default player controls
+              mediaElement.preload = 'metadata'; // or 'auto'
+              // Add a source element for robustness if needed, though src on audio is fine
+              // const sourceElement = document.createElement('source');
+              // sourceElement.src = mediaUrl;
+              // // You might add type="..." here if you know the MIME type
+              // mediaElement.appendChild(sourceElement);
+
+              mediaContainer.innerHTML = ''; // Clear placeholder
+              mediaContainer.appendChild(mediaElement);
+
+
             } else if (mediaType === YOUTUBE_TYPE) {
               const youtubeRegexMatch = mediaUrl.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|m\.youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/);
               const videoId = (youtubeRegexMatch && youtubeRegexMatch[1]) ? youtubeRegexMatch[1] : null;
               if (videoId) {
                 const embedUrl = `https://www.youtube.com/embed/${videoId}`;
-                mediaElementHTML = `<div class="youtube-embed-container"><iframe src="${embedUrl}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen loading="lazy"></iframe></div>`;
+                mediaElement = document.createElement('iframe');
+                mediaElement.src = embedUrl;
+                mediaElement.setAttribute('frameborder', '0');
+                mediaElement.setAttribute('allow', 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share');
+                mediaElement.setAttribute('allowfullscreen', '');
+                 mediaElement.loading = 'lazy';
+                const embedContainer = document.createElement('div');
+                embedContainer.classList.add('youtube-embed-container');
+                embedContainer.appendChild(mediaElement);
+                mediaContainer.innerHTML = ''; // Clear placeholder
+                mediaContainer.appendChild(embedContainer);
               } else {
-                mediaElementHTML = '<span class="error">Failed to embed YouTube video (Invalid URL).</span>';
+                mediaContainer.innerHTML = '<span class="error">Failed to embed YouTube video (Invalid URL).</span>';
               }
             } else {
-              mediaElementHTML = '<span class="error">Unsupported media type: ' + mediaType + '</span>';
+              mediaContainer.innerHTML = '<span class="error">Unsupported media type: ' + mediaType + '</span>';
             }
-            mediaContainer.innerHTML = mediaElementHTML;
-          }
+
+            // Add error handler to the media element if it was created
+            if (mediaElement && (mediaElement.tagName === 'VIDEO' || mediaElement.tagName === 'AUDIO' || mediaElement.tagName === 'IMG' || mediaElement.tagName === 'IFRAME')) {
+                 mediaElement.onerror = function(e) {
+                    console.error('Media loading failed:', this.src || this.data-media-url, e);
+                    // Check if the error handler is already present to avoid duplicates
+                    if (!mediaContainer.querySelector('.media-error-message')) {
+                         const errorSpan = document.createElement('span');
+                         errorSpan.classList.add('error', 'media-error-message');
+                         errorSpan.textContent = 'Failed to load media. Check the file format, URL, or server configuration.';
+                         // Clear existing content before adding error message
+                         mediaContainer.innerHTML = '';
+                         mediaContainer.appendChild(errorSpan);
+                    }
+                 };
+             }
+
+          } // end if (needsLoad)
+
         } else {
+          // Hide media
           mediaContainer.style.display = 'none';
           button.textContent = viewButtonText;
+
           // Stop media playback and clear iframe src
           mediaContainer.querySelectorAll('video, audio, iframe').forEach(mediaElement => {
             if ((mediaElement.tagName === 'VIDEO' || mediaElement.tagName === 'AUDIO') && typeof mediaElement.pause === 'function') {
               mediaElement.pause();
-            } else if (mediaElement.tagName === 'IFRAME' && mediaElement.src.includes('youtube.com/embed')) {
-              mediaElement.src = ''; // Clear src to stop potential background activity
+              // Optional: reset time to 0
+              // mediaElement.currentTime = 0;
+            } else if (mediaElement.tagName === 'IFRAME' && mediaElement.src && mediaElement.src.includes('youtube.com/embed')) {
+              // Replace src with about:blank to stop playback and free resources
+              mediaElement.src = 'about:blank';
+              // Setting src back to the correct URL later will reload it
             }
           });
-          mediaContainer.innerHTML = ''; // Clear content to force reload next time
-          delete mediaContainer.dataset.loadedUrl;
+          // Clear content completely when hidden, forcing a reload next time it's shown
+          mediaContainer.innerHTML = '';
+          delete mediaContainer.dataset.loadedUrl; // Remove marker
         }
       }
+
 
       function toggleFullText(button, fullTextId) {
         const truncatedDiv = button.closest('.comment-truncated');
@@ -1465,6 +1657,7 @@ if ($show_board_index) {
       }
 
       document.addEventListener('DOMContentLoaded', function() {
+        // --- Event Delegation for Clicks ---
         document.body.addEventListener('click', function(event) {
           // Media toggle button
           if (event.target.matches('.show-media-btn')) {
@@ -1492,9 +1685,13 @@ if ($show_board_index) {
               toggleReplyForm(threadIdMatch[1]);
             }
           }
+          // New Thread Form Toggle Button
+           else if (event.target.matches('#togglePostFormButton')) {
+               togglePostForm(); // Call the dedicated toggle function
+           }
         });
 
-        // Post highlighting logic
+        // --- Post highlighting logic ---
         let highlightTimeout = null;
         function highlightPost(targetPost, addClass) {
           if (!targetPost) return;
@@ -1509,7 +1706,7 @@ if ($show_board_index) {
           }
         }
 
-        // Highlight on hover
+        // Highlight on hover for reply mentions (>>123)
         document.body.addEventListener('mouseover', function(event) {
           const link = event.target.closest('.reply-mention');
           if (link && link.getAttribute('href')?.startsWith('#post-')) {
@@ -1528,7 +1725,7 @@ if ($show_board_index) {
           }
         });
 
-        // Highlight on click (for persistence after click)
+        // Highlight on click for reply mentions (>>123)
         document.body.addEventListener('click', function(event) {
           const link = event.target.closest('.reply-mention');
           if (link && link.getAttribute('href').startsWith('#post-')) {
@@ -1547,6 +1744,64 @@ if ($show_board_index) {
           // No need to scroll here, the browser default behavior for hash links handles it.
           // The :target { scroll-margin-top: ... } CSS rule helps position it correctly.
         }
+
+        // Check if the page was loaded due to a form submission (ts parameter)
+        // And scroll to the bottom or to the new post ID if available
+        // This behavior is now primarily handled by the redirect with hash.
+
+        // --- New Thread Form Collapse Logic ---
+        const postFormContent = document.getElementById('postFormContent');
+        const toggleButton = document.getElementById('togglePostFormButton');
+
+        if (postFormContent && toggleButton && currentChannel) { // Ensure elements exist and we are on a channel page
+            const stateKey = 'postFormState_channel_' + currentChannel;
+
+            function applyPostFormState(state) {
+                if (state === 'expanded') {
+                    postFormContent.style.display = 'block';
+                    toggleButton.textContent = 'Hide Form';
+                } else { // 'collapsed' or default
+                    postFormContent.style.display = 'none';
+                    toggleButton.textContent = 'Show Form';
+                }
+            }
+
+            function togglePostForm() {
+                const isCollapsed = postFormContent.style.display === 'none' || postFormContent.style.display === '';
+                const newState = isCollapsed ? 'expanded' : 'collapsed';
+                applyPostFormState(newState);
+                try {
+                   localStorage.setItem(stateKey, newState);
+                } catch (e) {
+                   console.error("Failed to save post form state to Local Storage:", e);
+                   // Optionally inform the user that state won't be remembered
+                }
+            }
+
+            // Apply saved state on load
+            try {
+                const savedState = localStorage.getItem(stateKey);
+                if (savedState) {
+                    applyPostFormState(savedState);
+                } else {
+                    // Default state is collapsed, which is handled by CSS/initial JS `display: none`
+                    // Ensure button text is correct for the default collapsed state
+                    toggleButton.textContent = 'Show Form';
+                }
+            } catch (e) {
+                 console.error("Failed to read post form state from Local Storage:", e);
+                 // Ensure the form is hidden by default if LS fails
+                 postFormContent.style.display = 'none';
+                 toggleButton.textContent = 'Show Form';
+            }
+
+        } else {
+            // Remove the toggle button if the form section isn't present
+            if (toggleButton) {
+                toggleButton.remove();
+            }
+        }
+
       });
     </script>
   </head>
@@ -1578,11 +1833,12 @@ if ($show_board_index) {
                       $class = (!$show_board_index && $channel_code_nav === $current_channel_code) ? 'active' : '';
                     ?>
                     <a href="./?channel=<?php echo urlencode($channel_code_nav); ?>" class="<?php echo $class; ?>"><?php echo htmlspecialchars($display_name); ?></a>
-                  <?php else: error_log("Warning: Channel code '{$channel_code_nav}' in category '{$category_name}' is not defined."); ?>
+                  <?php else: error_log("Warning: Channel code '{$channel_code_nav}' in category '{$category_name}' is not defined in CHANNEL_NAMES."); ?>
                   <?php endif; ?>
                 <?php endforeach; ?>
               <?php endforeach; ?>
               <?php
+                // List uncategorized channels separately
                 $categorized_channels_flat = array_merge(...array_values($channel_categories));
                 $uncategorized = array_diff(ALLOWED_CHANNELS, $categorized_channels_flat);
               ?>
@@ -1640,7 +1896,7 @@ if ($show_board_index) {
           <div class="thread-view-header">
             [<a href="./?channel=<?php echo urlencode($current_channel_code); ?>">Return to /<?php echo htmlspecialchars($current_channel_code); ?>/ - <?php echo htmlspecialchars($current_channel_display_name); ?></a>]
           </div>
-          <div class="post-form" id="post-form">
+          <div class="reply-form-container"> <!-- This is the REPLY form, not the new thread form -->
             <h4>Reply to Thread No.<?php echo $viewing_thread_id; ?></h4>
             <form action="./?channel=<?php echo urlencode($current_channel_code); ?>&thread=<?php echo $viewing_thread_id; ?>" method="post" enctype="multipart/form-data">
               <input type="hidden" name="thread_id" value="<?php echo $viewing_thread_id; ?>">
@@ -1652,7 +1908,7 @@ if ($show_board_index) {
                  </tr>
                  <tr>
                    <th><label for="reply_password">Password</label></th>
-                   <td><input type="password" name="password" id="reply_password" size="30"> <small>(Required if username used before)</small></td>
+                   <td><input type="password" name="password" id="reply_password" size="30"> <small>(Required if username registered)</small></td>
                  </tr>
                  <tr>
                    <th><label for="reply_comment">Comment</label></th>
@@ -1671,16 +1927,17 @@ if ($show_board_index) {
           </div>
           <hr>
           <?php
-            $thread = $thread_op;
+            $thread = $threads[0]; // In thread view, $threads contains only the OP
             $thread_id = $thread['id'];
             $post_element_id = 'post-' . $thread_id;
-            $post_media_buttons_html = '';
+            $post_media_html = ''; // Combine uploaded file and link media HTML
             $display_name = (!empty($thread['username'])) ? htmlspecialchars($thread['username']) : 'Anonymous';
 
-            // 1. Handle Uploaded File
+            // 1. Handle Uploaded File for OP
             if ($thread['image']) {
               $uploaded_media_relative_path = $thread['image'];
-              $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($uploaded_media_relative_path);
+              // Sanitize URL part carefully
+              $uploaded_media_url = UPLOADS_URL_PATH . '/' . str_replace(['../', './'], '', htmlspecialchars($uploaded_media_relative_path, ENT_QUOTES, 'UTF-8'));
               $uploaded_media_local_path = UPLOADS_DIR . '/' . $uploaded_media_relative_path;
               $orig_name = htmlspecialchars($thread['image_orig_name'] ?? basename($thread['image']));
               $img_w = $thread['image_w'] ?? '?';
@@ -1690,14 +1947,14 @@ if ($show_board_index) {
               $uploaded_media_type = get_render_media_type($uploaded_media_relative_path);
               $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
               $media_item_id = $post_element_id . '-uploaded';
-              $post_media_buttons_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
+              $post_media_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
             }
 
-            // 2. Process Comment Links
+            // 2. Process Comment Links for OP
             $comment_raw_from_db = $thread['comment'];
             $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
             $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
-            $post_media_buttons_html .= $link_media_result['media_html'];
+            $post_media_html .= $link_media_result['media_html']; // Append link media HTML
 
             // 3. Format Comment
             $formatted_comment = format_comment($cleaned_comment_for_formatting);
@@ -1713,7 +1970,7 @@ if ($show_board_index) {
                 <span class="post-id">No.<?php echo $thread_id; ?></span>
                 <a href="#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a>
               </p>
-              <?php echo $post_media_buttons_html; // Display combined media buttons ?>
+              <?php echo $post_media_html; // Display combined media buttons and containers ?>
               <div class="comment"><?php echo $formatted_comment; ?></div>
             </div><!-- /.post.op -->
 
@@ -1723,13 +1980,14 @@ if ($show_board_index) {
                 <?php
                   $reply_id = $reply['id'];
                   $post_element_id = 'post-' . $reply_id;
-                  $reply_media_buttons_html = '';
+                  $reply_media_html = ''; // Combine uploaded file and link media HTML
                   $display_name_reply = (!empty($reply['username'])) ? htmlspecialchars($reply['username']) : 'Anonymous';
 
                   // 1. Handle Uploaded File for Reply
                   if ($reply['image']) {
                     $uploaded_media_relative_path = $reply['image'];
-                    $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($uploaded_media_relative_path);
+                    // Sanitize URL part carefully
+                    $uploaded_media_url = UPLOADS_URL_PATH . '/' . str_replace(['../', './'], '', htmlspecialchars($uploaded_media_relative_path, ENT_QUOTES, 'UTF-8'));
                     $uploaded_media_local_path = UPLOADS_DIR . '/' . $uploaded_media_relative_path;
                     $orig_name = htmlspecialchars($reply['image_orig_name'] ?? basename($reply['image']));
                     $img_w = $reply['image_w'] ?? '?';
@@ -1739,14 +1997,14 @@ if ($show_board_index) {
                     $uploaded_media_type = get_render_media_type($uploaded_media_relative_path);
                     $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
                     $media_item_id = $post_element_id . '-uploaded';
-                    $reply_media_buttons_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
+                    $reply_media_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
                   }
 
                   // 2. Process Comment Links for Reply
                   $comment_raw_from_db = $reply['comment'];
                   $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
                   $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
-                  $reply_media_buttons_html .= $link_media_result['media_html'];
+                  $reply_media_html .= $link_media_result['media_html']; // Append link media HTML
 
                   // 3. Format Reply Comment
                   $formatted_comment = format_comment($cleaned_comment_for_formatting);
@@ -1758,7 +2016,7 @@ if ($show_board_index) {
                     <span class="post-id">No.<?php echo $reply_id; ?></span>
                     <a href="#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a>
                   </p>
-                  <?php echo $reply_media_buttons_html; // Display combined media buttons ?>
+                  <?php echo $reply_media_html; // Display combined media buttons and containers ?>
                   <div class="comment"><?php echo $formatted_comment; ?></div>
                 </div><!-- /.reply -->
               <?php endforeach; ?>
@@ -1767,39 +2025,42 @@ if ($show_board_index) {
           <hr>
 
         <?php else: // --- Board View --- ?>
-          <div class="post-form" id="post-form">
+          <div class="post-form" id="post-form"> <!-- This is the New Thread Form container -->
             <h2>Post a new thread in /<?php echo htmlspecialchars($current_channel_code); ?>/ - <?php echo htmlspecialchars($current_channel_display_name); ?></h2>
-            <form action="./?channel=<?php echo urlencode($current_channel_code); ?>" method="post" enctype="multipart/form-data">
-              <input type="hidden" name="form_type" value="new_thread">
-              <input type="hidden" name="channel" value="<?php echo htmlspecialchars($current_channel_code); ?>">
-              <table>
-                 <tr>
-                   <th><label for="username">Username</label></th>
-                   <td><input type="text" name="username" id="username" size="30" maxlength="<?php echo USERNAME_MAX_LENGTH; ?>"> <small>(Optional)</small></td>
-                 </tr>
-                 <tr>
-                   <th><label for="password">Password</label></th>
-                   <td><input type="password" name="password" id="password" size="30"> <small>(Required to register username)</small></td>
-                 </tr>
-                 <tr>
-                   <th><label for="subject">Subject</label></th>
-                   <td><input type="text" name="subject" id="subject" size="30"></td>
-                 </tr>
-                 <tr>
-                   <th><label for="comment">Post</label></th>
-                   <td><textarea name="comment" id="comment" rows="5" cols="50"></textarea></td>
-                 </tr>
-                 <tr>
-                   <th><label for="image">File</label></th>
-                   <td><input type="file" name="image" id="image" accept=".<?php echo implode(',.', ALLOWED_EXTENSIONS); ?>,video/*,audio/*,image/*"></td>
-                 </tr>
-                 <tr>
-                   <th></th>
-                   <td><input type="submit" value="Submit Thread"> <small>(Max: <?php echo MAX_FILE_SIZE / 1024 / 1024; ?> MB)</small></td>
-                 </tr>
-              </table>
-            </form>
-          </div>
+            <button id="togglePostFormButton" class="toggle-button" type="button">Show Form</button> <!-- Toggle Button -->
+            <div id="postFormContent" class="post-form-content" style="display: none;"> <!-- Collapsible Content Wrapper -->
+                <form action="./?channel=<?php echo urlencode($current_channel_code); ?>" method="post" enctype="multipart/form-data">
+                  <input type="hidden" name="form_type" value="new_thread">
+                  <input type="hidden" name="channel" value="<?php echo htmlspecialchars($current_channel_code); ?>">
+                  <table>
+                     <tr>
+                       <th><label for="username">Username</label></th>
+                       <td><input type="text" name="username" id="username" size="30" maxlength="<?php echo USERNAME_MAX_LENGTH; ?>"> <small>(Optional)</small></td>
+                     </tr>
+                     <tr>
+                       <th><label for="password">Password</label></th>
+                       <td><input type="password" name="password" id="password" size="30"> <small>(Required to register username)</small></td>
+                     </tr>
+                     <tr>
+                       <th><label for="subject">Subject</label></th>
+                       <td><input type="text" name="subject" id="subject" size="30"></td>
+                     </tr>
+                     <tr>
+                       <th><label for="comment">Post</label></th>
+                       <td><textarea name="comment" id="comment" rows="5" cols="50"></textarea></td>
+                     </tr>
+                     <tr>
+                       <th><label for="image">File</label></th>
+                       <td><input type="file" name="image" id="image" accept=".<?php echo implode(',.', ALLOWED_EXTENSIONS); ?>,video/*,audio/*,image/*"></td>
+                     </tr>
+                     <tr>
+                       <th></th>
+                       <td><input type="submit" value="Submit Thread"> <small>(Max: <?php echo MAX_FILE_SIZE / 1024 / 1024; ?> MB)</small></td>
+                     </tr>
+                  </table>
+                </form>
+            </div> <!-- /#postFormContent -->
+          </div> <!-- /.post-form -->
           <hr>
           <?php if ($total_threads == 0): ?>
             <p style="text-align: center; color: #aaa; margin-top: 30px;">No threads in /<?php echo htmlspecialchars($current_channel_code); ?>/ (<?php echo htmlspecialchars($current_channel_display_name); ?>) yet. Be the first!</p>
@@ -1826,13 +2087,14 @@ if ($show_board_index) {
                 $total_reply_count = $reply_counts[$thread_id] ?? 0;
                 $omitted_count = max(0, $total_reply_count - count($thread_replies_preview));
                 $display_name_thread = (!empty($thread['username'])) ? htmlspecialchars($thread['username']) : 'Anonymous';
-                $thread_media_buttons_html = '';
+                $thread_media_html = ''; // Combine uploaded file and link media HTML
                 $comment_raw_from_db = $thread['comment'];
 
-                // 1. Handle Uploaded File
+                // 1. Handle Uploaded File for OP (Board View)
                 if ($thread['image']) {
                   $uploaded_media_relative_path = $thread['image'];
-                  $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($uploaded_media_relative_path);
+                  // Sanitize URL part carefully
+                   $uploaded_media_url = UPLOADS_URL_PATH . '/' . str_replace(['../', './'], '', htmlspecialchars($uploaded_media_relative_path, ENT_QUOTES, 'UTF-8'));
                   $uploaded_media_local_path = UPLOADS_DIR . '/' . $uploaded_media_relative_path;
                   $orig_name = htmlspecialchars($thread['image_orig_name'] ?? basename($thread['image']));
                   $img_w = $thread['image_w'] ?? '?';
@@ -1841,14 +2103,14 @@ if ($show_board_index) {
                   $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
                   $uploaded_media_type = get_render_media_type($uploaded_media_relative_path);
                   $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
-                  $media_item_id = $post_element_id . '-uploaded';
-                  $thread_media_buttons_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
+                   $media_item_id = $post_element_id . '-uploaded';
+                  $thread_media_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
                 }
 
-                // 2. Process Comment Links
+                // 2. Process Comment Links for OP (Board View)
                 $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
                 $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
-                $thread_media_buttons_html .= $link_media_result['media_html'];
+                $thread_media_html .= $link_media_result['media_html']; // Append link media HTML
 
                 // 3. Format & Truncate Comment
                 $formatted_comment = format_comment($cleaned_comment_for_formatting);
@@ -1876,9 +2138,9 @@ if ($show_board_index) {
                     <?php if ($total_reply_count > 0): ?>
                       <span class="reply-count">(<?php echo $total_reply_count; ?> replies)</span>
                     <?php endif; ?>
-                     <a href="#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a>
+                     <a href="./?channel=<?php echo urlencode($current_channel_code); ?>&thread=<?php echo $thread_id; ?>#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a>
                   </p>
-                  <?php echo $thread_media_buttons_html; // Display combined media buttons ?>
+                  <?php echo $thread_media_html; // Display combined media buttons and containers ?>
                   <div class="comment"><?php echo $display_comment_html; ?></div>
                 </div><!-- /.post.op -->
 
@@ -1894,7 +2156,7 @@ if ($show_board_index) {
                        </tr>
                        <tr>
                          <th><label for="reply_password_q_<?php echo $thread_id; ?>">Password</label></th>
-                         <td><input type="password" name="password" id="reply_password_q_<?php echo $thread_id; ?>" size="30"> <small>(Required if username used before)</small></td>
+                         <td><input type="password" name="password" id="reply_password_q_<?php echo $thread_id; ?>" size="30"> <small>(Required if username registered)</small></td>
                        </tr>
                        <tr>
                          <th><label for="reply_comment_<?php echo $thread_id; ?>">Comment</label></th>
@@ -1920,14 +2182,15 @@ if ($show_board_index) {
                     <?php
                       $reply_id = $reply['id'];
                       $post_element_id = 'post-' . $reply_id;
-                      $reply_media_buttons_html = '';
+                      $reply_media_html = ''; // Combine uploaded file and link media HTML
                       $comment_raw_from_db = $reply['comment'];
                       $display_name_reply_preview = (!empty($reply['username'])) ? htmlspecialchars($reply['username']) : 'Anonymous';
 
                       // 1. Handle Uploaded File for Reply Preview
                       if ($reply['image']) {
                         $uploaded_media_relative_path = $reply['image'];
-                        $uploaded_media_url = UPLOADS_URL_PATH . '/' . htmlspecialchars($uploaded_media_relative_path);
+                        // Sanitize URL part carefully
+                        $uploaded_media_url = UPLOADS_URL_PATH . '/' . str_replace(['../', './'], '', htmlspecialchars($uploaded_media_relative_path, ENT_QUOTES, 'UTF-8'));
                         $uploaded_media_local_path = UPLOADS_DIR . '/' . $uploaded_media_relative_path;
                         $orig_name = htmlspecialchars($reply['image_orig_name'] ?? basename($reply['image']));
                         $img_w = $reply['image_w'] ?? '?';
@@ -1936,14 +2199,15 @@ if ($show_board_index) {
                         $file_size_kb = $file_size ? round($file_size / 1024) . ' KB' : '? KB';
                         $uploaded_media_type = get_render_media_type($uploaded_media_relative_path);
                         $view_button_text = ($uploaded_media_type == 'image') ? 'View Image' : (($uploaded_media_type == 'video') ? 'View Video' : (($uploaded_media_type == 'audio') ? 'View Audio' : 'View File'));
-                        $media_item_id = $post_element_id . '-uploaded';
-                        $reply_media_buttons_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
+                         $media_item_id = $post_element_id . '-uploaded';
+                        $reply_media_html .= "<div class='file-info uploaded-file-info'><div class='media-toggle'><button class='show-media-btn' data-media-id='{$media_item_id}' data-media-url='{$uploaded_media_url}' data-media-type='{$uploaded_media_type}'>{$view_button_text}</button></div><span class='file-details'>File: <a href='{$uploaded_media_url}' target='_blank' rel='noopener noreferrer'>{$orig_name}</a> ({$file_size_kb}" . (($img_w != '?') ? ", {$img_w}x{$img_h}" : "") . ")</span></div><div id='media-container-{$media_item_id}' class='media-container' style='display:none;'></div>";
                       }
 
                       // 2. Process Comment Links for Reply Preview
                       $link_media_result = process_comment_media_links($comment_raw_from_db, $post_element_id);
                       $cleaned_comment_for_formatting = $link_media_result['cleaned_text'];
-                      $reply_media_buttons_html .= $link_media_result['media_html'];
+                      $reply_media_html .= $link_media_result['media_html']; // Append link media HTML
+
 
                       // 3. Format & Truncate Reply Preview Comment
                       $formatted_comment = format_comment($cleaned_comment_for_formatting);
@@ -1964,7 +2228,7 @@ if ($show_board_index) {
                         <span class="post-id">No.<?php echo $reply_id; ?></span>
                         <a href="./?channel=<?php echo urlencode($current_channel_code); ?>&thread=<?php echo $thread_id; ?>#<?php echo $post_element_id; ?>" class="reply-link" title="Link to this post">▶</a>
                       </p>
-                      <?php echo $reply_media_buttons_html; // Display combined media buttons ?>
+                      <?php echo $reply_media_html; // Display combined media buttons and containers ?>
                       <div class="comment"><?php echo $display_comment_html; ?></div>
                     </div><!-- /.reply -->
                   <?php endforeach; ?>
