@@ -8,7 +8,6 @@
 ## Features
 
 - Easy to install – just drop `index.php` on your server
-- Flat-file storage (no database required)
 - Lightweight and fast
 - Clean and minimal UI
 - Fully customizable with a few lines of code
