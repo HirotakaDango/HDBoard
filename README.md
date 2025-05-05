@@ -101,12 +101,6 @@ You can edit `index.php` directly to modify:
 
 ---
 
-## License
-
-This project is released under the MIT License.
-
----
-
 ## Credits
 
 - Inspired by [4chan](https://4chan.org/) and classic imageboards.
