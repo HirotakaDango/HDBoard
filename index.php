@@ -244,12 +244,121 @@ try {
   die("A critical error occurred with the database connection. Please check server logs.");
 }
 
+// --- AJAX Endpoint: Load More Replies ---
+if (isset($_GET['action']) && $_GET['action'] === 'load_more_replies') {
+  header('Content-Type: application/json');
+  $thread_id = filter_input(INPUT_GET, 'thread_id', FILTER_VALIDATE_INT);
+  $offset = filter_input(INPUT_GET, 'offset', FILTER_VALIDATE_INT) ?: 25;
+  
+  if (!$thread_id) {
+    echo json_encode(['success' => false, 'error' => 'Invalid Thread ID']);
+    exit;
+  }
+  
+  try {
+    $stmt = $db->prepare("SELECT * FROM replies WHERE thread_id = ? ORDER BY created_at ASC LIMIT 25 OFFSET ?");
+    $stmt->bindValue(1, $thread_id, PDO::PARAM_INT);
+    $stmt->bindValue(2, $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $replies = $stmt->fetchAll();
+    
+    // Fetch associated users to render roles safely
+    $user_ids = array_unique(array_filter(array_column($replies, 'user_id')));
+    $users_data = [];
+    if (!empty($user_ids)) {
+      $placeholders = implode(',', array_fill(0, count($user_ids), '?'));
+      $user_stmt = $db->prepare("SELECT id, username, role, status FROM users WHERE id IN ($placeholders)");
+      $user_stmt->execute(array_values($user_ids));
+      while ($row = $user_stmt->fetch()) {
+        $users_data[$row['id']] = $row;
+      }
+    }
+    
+    $current_user = get_session_user();
+    $html = '';
+    
+    foreach ($replies as $reply) {
+      $reply_id = $reply['id'];
+      $reply_element_id_prefix = 'post-' . $reply_id;
+      $reply_user_info = (!empty($reply['user_id']) && isset($users_data[$reply['user_id']])) ? $users_data[$reply['user_id']] : null;
+      $reply_display_name = $reply_user_info ? h($reply_user_info['username']) : ($reply['username'] ? h($reply['username']) : 'Anonymous');
+      $reply_display_role = $reply_user_info ? $reply_user_info['role'] : null;
+      $reply_display_status = $reply_user_info ? $reply_user_info['status'] : null;
+      $reply_is_legacy_anon = !$reply_user_info && !empty($reply['username']) && !empty($reply['password_hash']);
+      $can_edit_reply = ($current_user && $reply_user_info && $current_user['id'] === $reply_user_info['id']) || user_has_role(ROLE_MODERATOR);
+      $can_delete_reply = ($current_user && $reply_user_info && $current_user['id'] === $reply_user_info['id']) || user_has_role(ROLE_JANITOR);
+      $show_ban_button_for_reply = $current_user && $reply_user_info && $reply_user_info['id'] !== $current_user['id'] && user_has_role(ROLE_JANITOR) && ($role_hierarchy[$current_user['role']] > $role_hierarchy[$reply_user_info['role']] || $current_user['role'] === ROLE_ADMIN);
+      
+      $reply_uploaded_media_html = generate_uploaded_media_html($reply, $reply_element_id_prefix);
+      $reply_link_media_result = process_comment_media_links($reply['comment'], $reply_element_id_prefix);
+      $reply_linked_media_html = $reply_link_media_result['media_html'];
+      $reply_formatted_comment = format_comment($reply_link_media_result['cleaned_text']);
+      
+      $html .= "
+      <div class='reply' id='{$reply_element_id_prefix}'>
+        <p class='post-info'>
+          <span class='name'>{$reply_display_name}</span>";
+      if ($reply_display_role) {
+        $html .= " <span class='role role-" . h($reply_display_role) . "'>( " . ucfirst(h($reply_display_role)) . " )</span>";
+      }
+      if ($reply_display_status === STATUS_BANNED) {
+        $html .= " <span class='status-banned'>[Banned]</span>";
+      }
+      if ($reply_is_legacy_anon) {
+        $html .= " <span class='role'>(Legacy)</span>";
+      }
+      $html .= "
+          <span class='time'>" . date('Y/m/d(D) H:i:s', strtotime($reply['created_at'])) . "</span>
+          <span class='post-id'>No.{$reply_id}</span>
+          <a href='#{$reply_element_id_prefix}' class='reply-link' title='Link to post'>▶</a>";
+      if ($can_edit_reply) {
+        $html .= " <span class='action-link'>[<a href='./?action=show_edit_form&type=reply&id={$reply_id}'>Edit</a>]</span>";
+      }
+      if ($can_delete_reply) {
+        $html .= " <span class='action-link'>[<a href='./?action=confirm_delete&type=reply&id={$reply_id}'>Delete</a>]</span>";
+      }
+      if ($show_ban_button_for_reply) {
+        $html .= "
+          <span class='action-link'>
+            <form action='./' method='post' style='display: inline;'>
+              <input type='hidden' name='action' value='" . ($reply_display_status === STATUS_BANNED ? 'unban_user' : 'ban_user') . "'>
+              <input type='hidden' name='user_id' value='{$reply_user_info['id']}'>
+              <input type='hidden' name='csrf_token' value='{$csrf_token}'>
+              <button type='submit'>[" . ($reply_display_status === STATUS_BANNED ? 'Unban' : 'Ban') . "]</button>
+            </form>
+          </span>";
+      }
+      $html .= "
+        </p>
+        {$reply_uploaded_media_html}
+        {$reply_linked_media_html}
+        <div class='comment'>{$reply_formatted_comment}</div>
+      </div>";
+    }
+    
+    echo json_encode([
+      'success' => true,
+      'html' => $html,
+      'count' => count($replies)
+    ]);
+    exit;
+  } catch (Exception $e) {
+    echo json_encode(['success' => false, 'error' => 'Database error']);
+    exit;
+  }
+}
+
 // --- Helper Functions ---
 function is_logged_in(): bool {
   return isset($_SESSION['user_id']);
 }
 
-function get_current_user(): ?array {
+// XSS Sanitization Helper
+function h(?string $str): string {
+  return htmlspecialchars($str ?? '', ENT_QUOTES, 'UTF-8');
+}
+
+function get_session_user(): ?array {
   if (!is_logged_in() || !isset($_SESSION['user_id'], $_SESSION['username'], $_SESSION['role'], $_SESSION['status'])) {
     return null;
   }
@@ -275,7 +384,7 @@ function logout_user() {
 
 function user_has_role(string $required_role): bool {
   global $role_hierarchy;
-  $user = get_current_user();
+  $user = get_session_user();
   if (!$user || !isset($role_hierarchy[$user['role']], $role_hierarchy[$required_role])) {
     return false;
   }
@@ -545,18 +654,25 @@ function process_comment_media_links($text, $post_element_id_prefix) {
   return ['cleaned_text' => trim($cleaned_text), 'media_html' => $media_html];
 }
 
-// --- Determine Current View ---
+// --- Determine Current View & Parse Search Queries ---
 $show_board_index = true;
 $current_channel_code = null;
 $current_channel_display_name = 'Board Index';
+$search_query = trim($_GET['search'] ?? '');
+
 $requested_channel = $_GET['channel'] ?? null;
 if ($requested_channel !== null && in_array($requested_channel, ALLOWED_CHANNELS)) {
   $current_channel_code = $requested_channel;
   $current_channel_display_name = CHANNEL_NAMES[$current_channel_code] ?? $current_channel_code;
   $show_board_index = false;
 }
+
+if ($search_query !== '') {
+  $show_board_index = false;
+}
+
 $viewing_thread_id = null;
-if (!$show_board_index) {
+if (!$show_board_index && $search_query === '') {
   $viewing_thread_id = filter_input(INPUT_GET, 'thread', FILTER_VALIDATE_INT);
   if ($viewing_thread_id === false || $viewing_thread_id === null) { $viewing_thread_id = null; }
 }
@@ -672,7 +788,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
       case 'ban_user':
       case 'unban_user':
-        $current_user = get_current_user();
+        $current_user = get_session_user();
         if (!$current_user || !user_has_role(ROLE_JANITOR)) {
           $action_error = "Permission denied.";
         } else {
@@ -723,7 +839,7 @@ if (isset($_REQUEST['action']) && !in_array($_REQUEST['action'], ['login', 'regi
   $post_type = in_array($_REQUEST['type'] ?? null, ['thread', 'reply']) ? $_REQUEST['type'] : null;
   $post_id = filter_var($_REQUEST['id'] ?? null, FILTER_VALIDATE_INT);
   $submitted_password = $_POST['password'] ?? null;
-  $current_user = get_current_user();
+  $current_user = get_session_user();
 
   if (!$post_type || !$post_id) {
     $action_error = $action_error ?? "Invalid request parameters.";
@@ -875,7 +991,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['action']) && !$show_
   } else {
     $comment_raw = trim($_POST['comment'] ?? '');
     $thread_id = filter_input(INPUT_POST, 'thread_id', FILTER_VALIDATE_INT);
-    $current_user = get_current_user();
+    $current_user = get_session_user();
     if (($current_user && $current_user['status'] === STATUS_BANNED) || ($_POST['channel'] ?? '') !== $current_channel_code) {
       $post_error = ($current_user && $current_user['status'] === STATUS_BANNED) ? "Your account is banned." : "Invalid channel for post.";
     }
@@ -969,7 +1085,70 @@ if (!empty($action_error) && in_array($show_action_form, ['delete_confirm', 'edi
 }
 
 if ($fetch_page_data) {
-  if ($show_board_index) {
+  // Execute Global Search with Pagination
+  $search_results = [];
+  $total_search_results = 0;
+  $search_total_pages = 1;
+  $search_current_page = 1;
+  if ($search_query !== '') {
+    $show_board_index = false;
+    $current_channel_display_name = "Search Results for '" . h($search_query) . "'";
+    try {
+      $search_term = '%' . $search_query . '%';
+      
+      // 1. Count matching rows in both threads and replies
+      $count_stmt = $db->prepare("
+        SELECT COUNT(*) FROM (
+          SELECT id FROM threads WHERE comment LIKE ? OR subject LIKE ?
+          UNION ALL
+          SELECT r.id FROM replies r JOIN threads t ON r.thread_id = t.id WHERE r.comment LIKE ?
+        )
+      ");
+      $count_stmt->execute([$search_term, $search_term, $search_term]);
+      $total_search_results = (int)$count_stmt->fetchColumn();
+      
+      // 2. Set up limits, pages and offsets (reusing THREADS_PER_PAGE configuration)
+      $search_current_page = max(1, filter_input(INPUT_GET, 'page', FILTER_VALIDATE_INT) ?: 1);
+      $search_total_pages = $total_search_results > 0 ? max(1, (int)ceil($total_search_results / THREADS_PER_PAGE)) : 1;
+      $search_current_page = min($search_current_page, $search_total_pages);
+      $offset = ($search_current_page - 1) * THREADS_PER_PAGE;
+      
+      // 3. Query paginated matches
+      $search_stmt = $db->prepare("
+        SELECT 'thread' AS post_type, id AS post_id, id AS thread_id, channel, subject, comment, created_at, user_id, username
+        FROM threads
+        WHERE comment LIKE ? OR subject LIKE ?
+        UNION ALL
+        SELECT 'reply' AS post_type, r.id AS post_id, r.thread_id, t.channel, NULL AS subject, r.comment, r.created_at, r.user_id, r.username
+        FROM replies r
+        JOIN threads t ON r.thread_id = t.id
+        WHERE r.comment LIKE ?
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      ");
+      $search_stmt->bindValue(1, $search_term, PDO::PARAM_STR);
+      $search_stmt->bindValue(2, $search_term, PDO::PARAM_STR);
+      $search_stmt->bindValue(3, $search_term, PDO::PARAM_STR);
+      $search_stmt->bindValue(4, THREADS_PER_PAGE, PDO::PARAM_INT);
+      $search_stmt->bindValue(5, $offset, PDO::PARAM_INT);
+      $search_stmt->execute();
+      $search_results = $search_stmt->fetchAll();
+      
+      // Collect user info to display matches safely
+      $user_ids_to_fetch = array_unique(array_filter(array_column($search_results, 'user_id')));
+      if (!empty($user_ids_to_fetch)) {
+        $user_placeholders = implode(',', array_fill(0, count($user_ids_to_fetch), '?'));
+        $user_stmt = $db->prepare("SELECT id, username, role, status FROM users WHERE id IN ($user_placeholders)");
+        $user_stmt->execute(array_values($user_ids_to_fetch));
+        while ($user_row = $user_stmt->fetch()) {
+          $users_data[$user_row['id']] = $user_row;
+        }
+      }
+    } catch (PDOException $e) {
+      error_log("Search SQL Error: " . $e->getMessage());
+      $action_error = "Database error occurred during search.";
+    }
+  } elseif ($show_board_index) {
     try {
       $thread_count_stmt = $db->prepare("SELECT COUNT(*) FROM threads WHERE channel = ?");
       $reply_count_stmt = $db->prepare("SELECT COUNT(r.id) FROM replies r JOIN threads t ON r.thread_id = t.id WHERE t.channel = ?");
@@ -1002,11 +1181,19 @@ if ($fetch_page_data) {
         if ($thread_op) {
           if (!empty($thread_op['user_id'])) $user_ids_to_fetch[] = $thread_op['user_id'];
           $threads = [$thread_op];
-          $replies_stmt = $db->prepare("SELECT * FROM replies WHERE thread_id = ? ORDER BY created_at ASC");
+          
+          // Get total count of replies in this thread
+          $count_stmt = $db->prepare("SELECT COUNT(*) FROM replies WHERE thread_id = ?");
+          $count_stmt->execute([$viewing_thread_id]);
+          $total_reply_count = (int)$count_stmt->fetchColumn();
+          
+          // Limit initial batch to 25 replies for rendering
+          $replies_stmt = $db->prepare("SELECT * FROM replies WHERE thread_id = ? ORDER BY created_at ASC LIMIT 25");
           $replies_stmt->execute([$viewing_thread_id]);
           $all_replies = $replies_stmt->fetchAll();
+          
           $replies_to_display[$viewing_thread_id] = $all_replies;
-          $reply_counts[$viewing_thread_id] = count($all_replies);
+          $reply_counts[$viewing_thread_id] = $total_reply_count;
           foreach ($all_replies as $reply) if (!empty($reply['user_id'])) $user_ids_to_fetch[] = $reply['user_id'];
         } else {
           $action_error = $action_error ?? "Thread not found in this channel.";
@@ -1065,7 +1252,7 @@ if ($fetch_page_data) {
     }
   }
 }
-$current_user = get_current_user();
+$current_user = get_session_user();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -1073,7 +1260,7 @@ $current_user = get_current_user();
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" type="image/png" href="/HDBoard.png">
-    <title><?php echo $show_board_index ? 'HDBoard - Board Index' : ('/' . htmlspecialchars($current_channel_code ?? '...') . '/ - ' . htmlspecialchars($current_channel_display_name ?? '...') . ($viewing_thread_id ? ' - Thread No.' . htmlspecialchars($viewing_thread_id) : '')); ?></title>
+    <title><?php echo $show_board_index ? 'HDBoard - Board Index' : ('/' . h($current_channel_code ?? '...') . '/ - ' . h($current_channel_display_name ?? '...') . ($viewing_thread_id ? ' - Thread No.' . h($viewing_thread_id) : '')); ?></title>
     <style>
       :root {
         --bg-color: #1a1a1a; --text-color: #e0e0e0; --border-color: #444; --post-bg: #282828;
@@ -1628,13 +1815,56 @@ $current_user = get_current_user();
             }
           } catch(e){}
         }
+        
+        // Progressive Reply Loader Handler
+        document.body.addEventListener('click', function(event) {
+          if (event.target && event.target.id === 'load-more-btn') {
+            const btn = event.target;
+            const threadId = btn.dataset.threadId;
+            const offset = parseInt(btn.dataset.offset, 10);
+            
+            btn.disabled = true;
+            btn.textContent = 'Loading...';
+            
+            fetch(`./?action=load_more_replies&thread_id=${threadId}&offset=${offset}`)
+              .then(res => res.json())
+              .then(data => {
+                if (data.success && data.html) {
+                  const container = document.querySelector('.reply-container');
+                  if (container) {
+                    const noReplies = container.querySelector('p');
+                    if (noReplies && noReplies.textContent.includes('No replies yet')) {
+                      noReplies.remove();
+                    }
+                    container.insertAdjacentHTML('beforeend', data.html);
+                  }
+                  
+                  const newOffset = offset + data.count;
+                  btn.dataset.offset = newOffset;
+                  btn.disabled = false;
+                  btn.textContent = 'Load More Replies';
+                  
+                  if (data.count < 25) {
+                    btn.parentElement.remove();
+                  }
+                } else {
+                  btn.disabled = false;
+                  btn.textContent = 'Failed to load. Try again.';
+                }
+              })
+              .catch(() => {
+                btn.disabled = false;
+                btn.textContent = 'Error loading. Try again.';
+              });
+          }
+        });
       });
     </script>
   </head>
   <body>
     <div class="container">
       <header>
-        <h1><?php echo $show_board_index ? 'HDBoard - Board Index' : ('/' . htmlspecialchars($current_channel_code ?? '...') . '/ - ' . htmlspecialchars($current_channel_display_name ?? '...') . ($viewing_thread_id ? ' - Thread No.' . htmlspecialchars($viewing_thread_id) : '')); ?></h1>
+        <h1><?php echo $show_board_index ? 'HDBoard - Board Index' : ('/' . h($current_channel_code ?? '...') . '/ - ' . h($current_channel_display_name ?? '...') . ($viewing_thread_id ? ' - Thread No.' . h($viewing_thread_id) : '')); ?></h1>
         <div class="flex-container">
           <img src="/HDBoard.png" alt="HDBoard Logo">
         </div>
@@ -1651,6 +1881,15 @@ $current_user = get_current_user();
             <a href="./?action=register">Register</a>
           <?php endif; ?>
         </div>
+        
+        <!-- Global Search Bar -->
+        <div class="search-container" style="text-align: center; margin: 15px 0 5px 0;">
+          <form action="./" method="get" style="display: inline-block;">
+            <input type="text" name="search" placeholder="Search threads & replies..." value="<?php echo h($search_query); ?>" style="padding: 6px 12px; width: 250px; background-color: var(--input-bg); color: var(--input-text); border: 1px solid var(--input-border); border-radius: 3px;" required>
+            <button type="submit" class="toggle-button" style="padding: 6px 12px; margin-left: 5px; cursor: pointer; background-color: var(--button-bg); color: var(--button-text); border: 1px solid var(--input-border); border-radius: 3px;">Search</button>
+          </form>
+        </div>
+
         <nav class="channel-nav">
           <?php if (!$show_board_index && $current_channel_code) : ?>
             <details class="channel-nav-collapsible">
@@ -1835,6 +2074,80 @@ $current_user = get_current_user();
             <p style="text-align: center; color: #aaa;">No boards found.</p>
           <?php endif; ?>
 
+        <?php elseif ($search_query !== ''): ?>
+          <div class="thread-view-header">Search Results for "<?php echo h($search_query); ?>" [<a href="./">Return to Index</a>]</div>
+          <?php if (empty($search_results)): ?>
+            <p style="text-align: center; color: #aaa; margin-top: 30px;">No matches found for "<?php echo h($search_query); ?>".</p>
+          <?php else: ?>
+            
+            <!-- Search Pagination (Top) -->
+            <div class="pagination">
+              <?php if ($search_current_page > 1) : ?>
+                <a href="./?search=<?php echo urlencode($search_query); ?>&page=<?php echo $search_current_page - 1; ?>"><< Prev</a>
+              <?php else : ?>
+                <span class="disabled"><< Prev</span>
+              <?php endif; ?>
+              <span> Page <span class="current-page"><?php echo $search_current_page; ?></span> / <?php echo $search_total_pages; ?> </span>
+              <?php if ($search_current_page < $search_total_pages) : ?>
+                <a href="./?search=<?php echo urlencode($search_query); ?>&page=<?php echo $search_current_page + 1; ?>">Next >></a>
+              <?php else : ?>
+                <span class="disabled">Next >></span>
+              <?php endif; ?>
+            </div>
+            <hr>
+
+            <?php foreach ($search_results as $item): ?>
+              <?php
+                $post_id = $item['post_id'];
+                $thread_id = $item['thread_id'];
+                $post_type = $item['post_type'];
+                $channel = $item['channel'];
+                $subject = $item['subject'];
+                $comment = $item['comment'];
+                $created_at = $item['created_at'];
+                $user_id = $item['user_id'];
+                $username = $item['username'];
+                
+                $user_info = (!empty($user_id) && isset($users_data[$user_id])) ? $users_data[$user_id] : null;
+                $display_name = $user_info ? h($user_info['username']) : ($username ? h($username) : 'Anonymous');
+                $display_role = $user_info ? $user_info['role'] : null;
+                $display_status = $user_info ? $user_info['status'] : null;
+                
+                $formatted_comment = format_comment($comment);
+              ?>
+              <div class="reply" style="margin-bottom: 15px; max-width: 100%;">
+                <p class="post-info">
+                  <span class="role" style="color: var(--accent-red); font-weight: bold;">[<?php echo strtoupper($post_type); ?> in /<?php echo h($channel); ?>/]</span>
+                  <?php if (!empty($subject)): ?><span class="subject"><?php echo h($subject); ?></span><?php endif; ?>
+                  <span class="name"><?php echo $display_name; ?></span>
+                  <?php if ($display_role): ?><span class="role role-<?php echo h($display_role); ?>">(<?php echo ucfirst(h($display_role)); ?>)</span><?php endif; ?>
+                  <?php if ($display_status === STATUS_BANNED): ?><span class="status-banned">[Banned]</span><?php endif; ?>
+                  <span class="time"><?php echo date('Y/m/d(D) H:i:s', strtotime($created_at)); ?></span>
+                  <span class="post-id">Post No.<?php echo $post_id; ?></span>
+                  <span class="reply-link">[<a href="./?channel=<?php echo urlencode($channel); ?>&thread=<?php echo $thread_id; ?>#post-<?php echo $post_id; ?>">Go to Post</a>]</span>
+                </p>
+                <div class="comment"><?php echo $formatted_comment; ?></div>
+              </div>
+            <?php endforeach; ?>
+            
+            <hr>
+            <!-- Search Pagination (Bottom) -->
+            <div class="pagination">
+              <?php if ($search_current_page > 1) : ?>
+                <a href="./?search=<?php echo urlencode($search_query); ?>&page=<?php echo $search_current_page - 1; ?>"><< Prev</a>
+              <?php else : ?>
+                <span class="disabled"><< Prev</span>
+              <?php endif; ?>
+              <span> Page <span class="current-page"><?php echo $search_current_page; ?></span> / <?php echo $search_total_pages; ?> </span>
+              <?php if ($search_current_page < $search_total_pages) : ?>
+                <a href="./?search=<?php echo urlencode($search_query); ?>&page=<?php echo $search_current_page + 1; ?>">Next >></a>
+              <?php else : ?>
+                <span class="disabled">Next >></span>
+              <?php endif; ?>
+            </div>
+
+          <?php endif; ?>
+
         <?php elseif ($current_channel_code): ?>
           <?php if (!$viewing_thread_id && in_array($current_channel_code, NSFW_CHANNELS)) : ?>
             <div class="nsfw-warning" id="nsfw-warning">
@@ -1974,6 +2287,11 @@ $current_user = get_current_user();
                   <p style="text-align: center; color: #aaa; margin-top: 15px;">No replies yet.</p>
                 <?php endif; ?>
               </div>
+              <?php if ($viewing_thread_id && $total_reply_count > 25): ?>
+                <div class="load-more-container" style="text-align: center; margin: 15px 0;">
+                  <button id="load-more-btn" data-thread-id="<?php echo $thread_id; ?>" data-offset="25" class="toggle-button" style="padding: 8px 16px; font-size: 1em; cursor: pointer;">Load More Replies</button>
+                </div>
+              <?php endif; ?>
             </div>
             <hr>
 
